@@ -10,6 +10,8 @@ Steps (decision 6; LTX decisions 57/60), pinned by runtime_manifest.json next to
   2 venv      <D>/venv on uv's own Python (--managed-python, pinned version), never a system one
   3 packages  numpy, OpenColorIO (>= 2.4 for Flame's ACES 2.0 config), Pillow at pinned versions
   4 check     imports, and the OCIO transform the job uses if Flame's config is installed
+  4b macOS     build the Swift progress and editor windows now (swiftc's first run takes ~1 min;
+              on first use it would freeze Flame for the Edit button); needs the Command Line Tools
   5 config    runtime_dir, runtime_python, runtime_ready in ~/.config/partner-models-ofx/config.conf
 Progress and Cancel in a window (cpo/oslayer.py). Everything is logged (cpo/log.py). The parts are
 adapted from LTX Alpha Gen's setup_helper.py (install_runtime, run, stream_copy, write_config).
@@ -210,8 +212,18 @@ def main() -> int:
     try:
         if sys.platform not in man["uv"]:
             raise SetupError(f"no runtime for {sys.platform} yet")
+        if sys.platform == "darwin" and subprocess.run(["/usr/bin/xcrun", "--find", "swiftc"],
+                                                       capture_output=True).returncode != 0:
+            raise SetupError("The Apple Command Line Tools are missing (they build the progress and editor "
+                             "windows): run xcode-select --install in Terminal, then press Install again.")
         os.makedirs(rt, exist_ok=True)
         py = install(man, rt, prog)
+        if sys.platform == "darwin":
+            prog.update(0.95, "building the progress and editor windows (first time ~1 min)")
+            failed = oslayer.prebuild_mac_helpers()
+            if failed:
+                raise SetupError(f"could not build {', '.join(failed)} (see ~/.cache/partner-models-ofx/logs)")
+            log.info("macOS helpers built")
         write_config({"runtime_dir": rt, "runtime_python": py, "runtime_ready": time.strftime("%Y-%m-%d")})
         prog.close()
         msg = f"Setup finished in {time.time() - t0:.0f} s. Runtime: {rt}"

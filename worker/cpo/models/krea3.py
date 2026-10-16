@@ -12,10 +12,6 @@ from .common import require_prompt, resolve_image_refs
 MODEL_ID = "krea/krea-3"
 
 
-def reference_pixels(params: dict) -> int:
-    return 1024 * 1024 if params.get("resolution") == "1K" else 2048 * 2048
-
-
 def build_request(router, params: dict, refs: list, log) -> dict:
     prompt = require_prompt(params)
     urls = []

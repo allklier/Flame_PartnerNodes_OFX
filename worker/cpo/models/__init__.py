@@ -1,7 +1,6 @@
 """Model modules (decision 2). Each worker/cpo/models/<module>.py provides:
 
   MODEL_ID                                  Router model id, e.g. "krea/krea-3"
-  reference_pixels(params) -> int           max pixels of an uploaded reference (0 = no limit)
   build_request(router, params, refs, log) -> dict
                                             the Router request body; refs are 8-bit sRGB PNGs
                                             (bytes), uploaded or inlined however the model needs

@@ -50,8 +50,14 @@ class CacheTest(unittest.TestCase):
     def test_result_layout_matches_cache_h(self):
         with tempfile.TemporaryDirectory() as root:
             img = np.random.default_rng(1).random((3, 4, 3)).astype(np.float32)
-            path = cache.write_result(root, "abcdef0123456789", img)
-            self.assertEqual(path, os.path.join(root, "ab", "abcdef0123456789.img"))
+            path = cache.write_result(root, "abcdef0123456789", "display", img)
+            self.assertEqual(path, os.path.join(root, "ab", "abcdef0123456789.display.img"))
+            with self.assertRaises(ValueError):
+                cache.write_result(root, "abcdef0123456789", "other", img)
+            raw = cache.write_model_image(root, "abcdef0123456789", b"\x89PNG....")
+            self.assertEqual(raw, os.path.join(root, "ab", "abcdef0123456789.model.png"))
+            self.assertEqual(cache.model_ext(b"\xff\xd8\xff"), "jpg")
+            self.assertEqual(cache.model_ext(b"RIFF0000WEBPVP8 "), "webp")
             raw = open(path, "rb").read()
             self.assertEqual(struct.unpack("<4sIIIII", raw[:24]), (b"CPOI", 1, 4, 3, 1, 3))
             back = np.frombuffer(raw[24:], "<f2").reshape(3, 4, 3)

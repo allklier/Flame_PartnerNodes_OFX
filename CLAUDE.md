@@ -57,6 +57,8 @@ generic Comfy integration.
   proxy a key of ours (bring your own key). `LICENSE` stays the verbatim MPL 2.0; the terms live in
   `README.md` ("Licensing and terms": unofficial, own account, Comfy ToS, billed to the user) and
   `NOTICE` (disclaimer, service terms, OpenFX BSD notice); both ship in the bundle's Resources.
+  The README says up front that the nodes are **provided as is** on the current Router API and may
+  stop working without warning if Comfy changes it or access to its endpoints (user, 2026-10-16).
   OPEN: ask Comfy (legal@comfy.org or Discord) for a written OK before a public release.
 - **12. Scaling to ~20 models** (user, 2026-10-16): keep compile-checked C++ param tables (no
   JSON-driven models: OFX would need a fixed pool of factory types); share request code per
@@ -71,22 +73,65 @@ generic Comfy integration.
   `worker/cpo/models/<m>.py` (MODEL_ID, reference_pixels, build_request, result_images), a fixture
   in `worker/tests/model_fixtures.py`; then ctest, then one live run.
 - **13. Edit button for text params** (user, 2026-10-16): Flame shows a plain string in one row, so
-  each Text param gets an "Edit <label>..." button (in place of the caption row) that opens
-  zenity `--text-info --editable` (zenity 3.32 on Rocky 9.7) pre-filled from a mode-600 staging
-  file, run while Flame waits; OK (exit 0) writes the text back, Cancel leaves it. UNVERIFIED in
-  Flame: the window over Flame, multi-line prompts in Flame's one-row field.
+  each Text param gets an "Edit <label>..." button (in place of the caption row). It runs
+  `worker/edit_text.py <file> <title>` under the runtime Python while Flame waits; the window is
+  `cpo/oslayer.py edit_text`: Linux zenity `--text-info --editable` (3.32 on Rocky 9.7; stdout =
+  the text, GTK warnings to /dev/null), macOS `mac_editor.swift` (resizable, Cmd-Return = OK,
+  Esc = Cancel, takes the focus). Exit 0 saved / 1 cancelled / 2 no editor. The text travels in a
+  mode-600 staging file. UNVERIFIED in Flame: the window over Flame, multi-line prompts in Flame's
+  one-row field.
+- **14. Output colour** (user, 2026-10-16; options revised by 16): an **Output** dropdown (column
+  "Result"): **BT.1886 Display** (the model's display-referred pixels, tagged Rec.1886), **Source
+  Colour Space** (the inverse of the input view, the 0.1 behaviour, tagged as the source) or
+  **Bypass** (the model's pixels, tagged as the source: no colour handling). The plugin tells Flame through
+  OFX 1.5 colour management (`ofxColour.h`): describe sets `ColourManagementStyle` = Core and
+  `AvailableConfigs` = `ofx-native-v1.5_aces-v1.3_ocio-v2.3`; the action
+  `OfxImageEffectActionGetOutputColourspace` answers `rec1886_rec709_display` (a Core colourspace,
+  label "Rec.1886 Rec.709 - Display", the display our ACES 2.0 view targets) or
+  `OfxColourspace_Source`. Flame 2027's binary contains all these names (`strings bin/flame`). The
+  OFX 1.4 Support library didn't dispatch that action: a small patch (VENDORED.txt, "[Partner Models
+  patch]") adds `ImageEffect::getOutputColourspace`. The log records what Flame negotiates (style,
+  config, clip colourspaces).
+  UNVERIFIED in Flame: the negotiated style, re-asking after the dropdown changes, how Flame shows it.
+- **15. Inputs** (user, 2026-10-16): up to **5 optional inputs**, Image 1 = OFX clip "Source",
+  Image 2..5 = "Image2".."Image5" (`ofx/src/core/inputs.h`), so the plugin is **General context
+  only** (LTX 63: Flame offers extra clips only there; 0.1/0.2 Filter nodes must be re-created).
+  Each connected input's first frame is sent, in order; `@ImageN` = input N. **Inputs must fill in
+  order from Image 1** (a gap is an error: INPUTS OUT OF ORDER marker + failed render, Generate
+  refuses). **No inputs** = prompt only: output **1920x1080** (`getRegionOfDefinition`) tagged
+  **Rec.1886** whatever Output says. Otherwise the output frame is Image 1's (overrides the General
+  context's union-of-inputs default). "Use Source" is gone (connect = send). Input Colour applies to
+  all inputs. Cache key = hash of every sent input's first frame + count + size (signature v2:
+  all older results regenerate). Both models: `maxReferences` 5 (Krea takes 8, Gemini 14).
+  UNVERIFIED in Flame: optional inputs, HD output with nothing connected.
+- **16. The cache keeps the model's image; Output never re-runs** (user, 2026-10-16, after the Mac
+  test). Per key: `<key>.model.<png|jpg|webp|bin>` = the API's image byte for byte, plus the
+  variants `<key>.display.img` (filled/cropped model pixels) and `<key>.source.img` (back to the
+  Input Colour; = display without inputs). job.py writes all three; render picks the variant for
+  Output (Source Colour Space with Image 1 → source, else display), so switching Output is instant
+  and costs nothing (OCIO lives only in Python, hence the variants are made right after the run).
+  Output is not in the key (signature v3: older results regenerate); Input Colour is (it changes
+  what the model sees). Sweep, purge and cache size treat a key's files as one. **Output follows
+  Input Colour** on a user edit (Bypass → Bypass, else BT.1886); default Bypass (Input's default).
+- **17. Input size limit warning** (user, 2026-10-16): each ModelSpec has `referencePixels(values)`
+  (Krea 3: 1K → 1024², 2K → 2048², as ComfyUI's node; Nano Banana Pro: 1K/2K/4K → 1024²/2048²/4096²,
+  ours) passed to job.py as `reference_pixels`, which scales larger inputs down (one source of
+  truth; the Python modules no longer define a limit). Generate asks first, before staging: "Image n:
+  WxH (x MP) -> about w'xh'... Continue? (No: scale them yourself upstream.)"; no answer → proceeds
+  with a footer warning (LTX 56 fallback). The job log notes each scaled input.
 - **10. As LTX:** logging + Collect Logs (39; `~/.cache/partner-models-ofx/logs/partner-models.log`),
   processed record (71: hidden `resultKey`; never generated → source passes through, "Not
   generated"; generated but no result → FAILED / CANCELLED / RESULT MISSING / OUT OF DATE marker
   on both outputs + failed render), Flame layout (37/52), only `eChangeUserEdit` + re-entrancy
-  guard, platform layer (64, Linux only so far), MPL 2.0 (53), vendored OpenFX 1.4 (BSD), C++14,
+  guard, platform layer (64: `platform_linux.cpp`, `platform_macos.cpp`; `reserveFile` because
+  macOS has no posix_fallocate), MPL 2.0 (53), vendored OpenFX 1.4 (BSD), C++14,
   build on Rocky 9 GCC 11.
 
 ## Layout (Flame: columns of ≤ 5 rows, 6 columns per tab, then overflow)
 
-Tab 1 (named after the model): [Krea 3] Input Colour, Generate, Status, Use Source ·
+Tab 1 (named after the model): [Krea 3] Input Colour, Generate, Status ·
 [Prompt] Edit Prompt... button + Prompt, Thinking Mode, Seed · [Output] Aspect Ratio, Resolution, Precise Edit ·
-[Cache] Cache Folder, Cache Size, Purge Cache, Purge All · [Cost] estimate · [ ] Version.
+[Cache] Cache Folder, Cache Size, Purge Cache, Purge All · [Result] Output · [ ] Version, Cost.
 Spacers fill models with fewer columns. Tab 2 "Setup": [API Key] caption, key, Save Key, Key status ·
 [Runtime] Runtime Folder, Install, status · [Support] Debug Logging,
 Collect Logs. `test_model_spec` checks every model column fits 5 rows.
@@ -101,9 +146,11 @@ Collect Logs. `test_model_spec` checks every model column fits 5 rows.
 - `worker/job.py`; `worker/cpo/`: `router.py` (Router client, stdlib), `colour.py`, `imageio.py`
   (PNG, fill/crop), `cache.py` (must match `cache.h`), `log.py`, `oslayer.py` (LTX copies),
   `models/` (loader, families `common.py`, `gemini.py`; `krea3.py`, `nano_banana_pro.py`). `helper/` (Setup). `flame_hook/`. `scripts/build_remote.sh`.
+- `packaging/install.sh`, `scripts/package_release*.sh` (Releases below).
 - `tools/cloud_smoke_test.py`: the Cloud API v2 probe of decision 1 (kept for a later plan).
 - Files: staged frame `cpo_job_<id>_in.bin` = `CPOA` header + float32 RGB; result
-  `<cache>/<k[0:2]>/<key>.img` = `CPOI` header + float16 RGB at the source size, source colour space.
+  `<cache>/<k[0:2]>/<key>.model.<ext>` + `<key>.{display,source}.img` = `CPOI` header + float16 RGB
+  at the output size (decision 16). Staged inputs `cpo_job_<id>_in<n>.bin`.
 
 ## Router API facts (verified 2026-10-16 with a live key and the queue docs)
 
@@ -153,8 +200,31 @@ Hostnames and machine paths stay out of committed files (LTX convention). `.giti
 LTX: its weights rule `models/` hid our model code until anchored to `/models/`; check
 `git add --dry-run` before committing.
 
+## macOS (built and unit-tested on Apple Silicon, 2026-10-16)
+
+Ported from LTX (decisions 64/65 there): `platform_macos.cpp`, CMake Apple branch (bundle
+`Contents/MacOS`, `osxSymbols`, Info.plist), `mac_progress.swift` (LTX's) and `mac_editor.swift`,
+both built at Install (`oslayer.prebuild_mac_helpers`; swiftc's first run ~1 min) — Install refuses
+without the Command Line Tools. darwin uv from the manifest; plugin and hook under
+`/Library/OFX/Plugins`. Build: `scripts/build_mac.sh` (as LTX's; pass LTX's `-stdlib++-isystem
+<SDK>/usr/include/c++/v1` CXX flag and `WORKER_TEST_PYTHON=<runtime python>`). Result: arm64 bundle,
+exports only the OFX entry points, ctest 4/4 (incl. OCIO round trip with Flame's Mac config).
+Setup on the Mac: 16 s, 217 MB. NOT yet: a live Router run on the Mac (needs the user's key there),
+the Swift progress/editor windows in use, Flame on the Mac.
+
+## Releases
+
+- `scripts/package_release.sh` (Rocky 9 host) and `scripts/package_release_mac.sh` (Mac) build a
+  release from a clean, committed tree, run ctest there, and copy
+  `dist/PartnerModels-<version>-{rocky9,macos-arm64}.tar.gz` back (bundle, `install.sh`, README,
+  LICENSE, NOTICE). `packaging/install.sh` (from LTX's): bundle into the OFX plugins folder,
+  our hook only if LTX's isn't installed (decision 7), refuses while Flame runs, `--uninstall`.
+- Gate: clean tree + ctest on both build machines (no system test yet, unlike LTX 67). Tag
+  `v<major.minor>` on the packaged commit; the user publishes the GitHub release.
+- **v0.1** (2026-10-16): first release, CPO_VERSION 0.1.0 (the dev builds had said 0.2.0).
+
 ## Roadmap
 
-macOS (LTX 64/65 layer), packaging + installer (LTX install.sh: bundle + hook only if no LTX hook),
+packaging + installer (LTX install.sh: bundle + hook only if no LTX hook),
 system test host (LTX 67), more models (Nano Banana 2 / 2.1:
 `vertexai/gemini-3.1-flash-image`, `vertexai/gemini-nano-banana-2.1`, reuse the gemini family), the Router-only Krea options (negative prompt, jam, ultra) if wanted.

@@ -37,6 +37,7 @@
 
 #include "cache.h"
 #include "half.h"
+#include "inputs.h"
 #include "log.h"
 #include "marker.h"
 #include "platform.h"
@@ -57,11 +58,30 @@ namespace {
 // Input Colour (decision 5, LTX 27): OCIO names in worker/cpo/colour.py. New entries at the end.
 const char* const kColourSpaces[] = {"Bypass", "ACEScg", "LogC4", "Log3G10", "LogC3", "BMD Film Gen5"};
 
+// Output (decisions 14/16): BT.1886 Display = the model's display-referred pixels, tagged Rec.1886
+// Rec.709 through OFX 1.5 colour management; Source Colour Space = converted back to the Input
+// Colour (the inverse of the input view), tagged as the source; Bypass = the model's pixels, tagged
+// as the source (no colour handling at all). All three come from the cache without a new run.
+// New entries at the end: setups store the index.
+const char* const kOutputs[] = {"BT.1886 Display", "Source Colour Space", "Bypass"};
+enum OutputMode { kOutDisplay = 0, kOutSource = 1, kOutBypass = 2 };
+// OFX 1.5 colour management (ofxColour.h; Flame 2027 implements it: the property and action names
+// are in its binary). Names from ofx-native-v1.5_aces-v1.3_ocio-v2.3.h: rec1886_rec709_display is
+// a Core colourspace, label "Rec.1886 Rec.709 - Display" (the display our ACES 2.0 view targets).
+constexpr const char* kCmStyle = "OfxImageEffectPropColourManagementStyle";
+constexpr const char* kCmStyleCore = "OfxImageEffectColourManagementCore";
+constexpr const char* kCmConfigs = "OfxImageEffectPropColourManagementAvailableConfigs";
+constexpr const char* kCmConfig = "OfxImageEffectPropColourManagementConfig";
+constexpr const char* kCmNativeConfig = "ofx-native-v1.5_aces-v1.3_ocio-v2.3";
+constexpr const char* kClipColourspace = "OfxImageClipPropColourspace";
+constexpr const char* kRec1886Display = "rec1886_rec709_display";
+constexpr const char* kSameAsSource = "OfxColourspace_Source";
+
 // Core params. Model params come from the ModelSpec; Text params get "<name>Caption" above them.
 constexpr const char* kPColour = "colourSpace";
 constexpr const char* kPGenerate = "generate";
 constexpr const char* kPStatus = "status";
-constexpr const char* kPUseSource = "useSource";
+constexpr const char* kPOutput = "outputColour";
 constexpr const char* kPCacheDir = "cacheDir";
 constexpr const char* kPCacheInfo = "cacheInfo";
 constexpr const char* kPPurgeNode = "purgeCache";
@@ -221,11 +241,12 @@ std::atomic<unsigned> gJobSeq{0};
 class PartnerEffect : public OFX::ImageEffect {
  public:
   PartnerEffect(OfxImageEffectHandle handle, const ModelSpec& spec) : ImageEffect(handle), spec_(spec) {
-    src_ = fetchClip(kOfxImageEffectSimpleSourceClipName);
+    for (int i = 0; i < inputCount(spec_); ++i) inputs_.push_back(fetchClip(inputClipName(i)));
+    src_ = inputs_[0];
     dst_ = fetchClip(kOfxImageEffectOutputClipName);
     colour_ = fetchChoiceParam(kPColour);
     status_ = fetchStringParam(kPStatus);
-    useSource_ = spec_.maxReferences > 0 ? fetchBooleanParam(kPUseSource) : nullptr;
+    output_ = fetchChoiceParam(kPOutput);
     cacheDir_ = fetchStringParam(kPCacheDir);
     cacheInfo_ = fetchStringParam(kPCacheInfo);
     cost_ = fetchStringParam(kPCost);
@@ -253,6 +274,7 @@ class PartnerEffect : public OFX::ImageEffect {
       refreshSetupUi();
       refreshCacheInfo();
       refreshCost();
+      logColourManagement("createInstance");
     } catch (const std::exception& e) {
       LOGE("createInstance: setting param values FAILED: %s [%s]", e.what(), typeid(e).name());
     }
@@ -294,13 +316,13 @@ class PartnerEffect : public OFX::ImageEffect {
       OFX::throwSuiteStatusException(kOfxStatFailed);
     }
     const OfxRectI db = out->getBounds();
-    std::unique_ptr<OFX::Image> src, ref;
-    std::vector<float> result;  // w*h*3, rows top-down, at the reference frame's size
+    std::unique_ptr<OFX::Image> src;  // Image 1 at this frame (pass-through)
+    std::vector<float> result;  // w*h*3, rows top-down, at the result's size
     std::vector<float> marker;  // w*h grey, rows top-down
     std::string message, caption;
     bool loud = false;          // the marker replaces the image (not a working pass-through)
-    bool failRender = false;    // generated before, but no result now (LTX 71)
-    OfxRectI rb = db;           // bounds of the reference frame (the result's size)
+    bool failRender = false;    // an error state: a buried node must not pass silently (LTX 71)
+    OfxRectI rb = db;           // where the result sits (Image 1's first frame, else HD at 0,0)
     const bool setupRequired = !runtimeState().ready;
     if (runtimeWasMissing_ && !setupRequired) {
       LOGI("render: the runtime is now installed; enabling the node's params");
@@ -308,34 +330,34 @@ class PartnerEffect : public OFX::ImageEffect {
     }
     runtimeWasMissing_ = setupRequired;
 
-    src.reset(src_->fetchImage(args.time));
+    if (src_->isConnected()) src.reset(src_->fetchImage(args.time));
+    Inputs in;
+    std::string err;
     if (setupRequired) {
       message = "Setup required: install the runtime in the Setup tab.";
       caption = "SETUP REQUIRED";
       loud = true;
-    } else if (!src) {
-      message = "No source image (is the input connected?).";
-      caption = "NOT CONNECTED";
-      loud = true;
-    } else if (src->getPixelDepth() != OFX::eBitDepthFloat) {
-      message = "Only 32-bit float images are supported.";
-      caption = "NOT SUPPORTED";
-      loud = true;
+    } else if (!gatherInputs(in, err)) {
+      message = err;
+      caption = in.gapAt >= 0 ? "INPUTS OUT OF ORDER" : "NOT SUPPORTED";
+      loud = failRender = true;
     } else {
-      ref.reset(src_->fetchImage(firstFrame()));  // decision 3: the result belongs to frame 1
-      if (!ref) ref.reset(src_->fetchImage(args.time));
-      rb = ref->getBounds();
-      const int w = rb.x2 - rb.x1, h = rb.y2 - rb.y1;
-      const std::string key = currentKey(*ref);
+      rb = in.bounds;
+      const std::string key = currentKey(in);
       std::vector<uint16_t> half;
-      if (readResult(cacheRoot(), key, uint32_t(w), uint32_t(h), half)) {
+      if (readResult(cacheRoot(), key, variant(), uint32_t(in.w), uint32_t(in.h), half)) {
         result.resize(half.size());
         halfToFloat(half.data(), result.data(), result.size());
       } else if (isPending(cacheRoot(), key)) {
         message = "Generating: the result is not ready yet.";
         caption = "GENERATING";
+        loud = !src;  // nothing to pass through
       } else if (!generatedBefore()) {
-        message = "Not generated: press Generate.";  // source passes through (LTX 71)
+        message = "Not generated: press Generate.";  // Image 1 passes through (LTX 71)
+        if (!src) {
+          caption = "NOT GENERATED";
+          loud = true;
+        }
       } else {
         failRender = loud = true;
         std::string stored;
@@ -352,11 +374,12 @@ class PartnerEffect : public OFX::ImageEffect {
           message = "Result missing: the cached image is gone (cache purged, or another machine). Press Generate.";
           caption = "RESULT MISSING";
         } else {
-          message = "Out of date: the source, prompt or settings changed since Generate. Press Generate.";
+          message = "Out of date: an input, the prompt or the settings changed since Generate. Press Generate.";
           caption = "OUT OF DATE";
         }
       }
-      LOGD("render t=%g key=%s %s", args.time, key.c_str(), result.empty() ? (caption.empty() ? "pass-through" : caption.c_str()) : "cache hit");
+      LOGD("render t=%g key=%s inputs=%d %s", args.time, key.c_str(), in.count,
+           result.empty() ? (caption.empty() ? "pass-through" : caption.c_str()) : "cache hit");
     }
 
     const int w = rb.x2 - rb.x1, h = rb.y2 - rb.y1;
@@ -380,7 +403,7 @@ class PartnerEffect : public OFX::ImageEffect {
           if (inside) std::memcpy(rgb, &result[i * 3], sizeof rgb);
         } else if (loud) {
           rgb[0] = rgb[1] = rgb[2] = a = inside && !marker.empty() ? marker[i] : 0.0f;
-        } else {  // not generated / generating: the source passes through; matte shows the marker
+        } else {  // not generated / generating: Image 1 passes through; matte shows the marker
           const bool inSrc = srcOk && x >= sb.x1 && x < sb.x2 && y >= sb.y1 && y < sb.y2;
           if (inSrc) {
             const auto* sp = static_cast<const float*>(src->getPixelAddress(x, y));
@@ -413,9 +436,65 @@ class PartnerEffect : public OFX::ImageEffect {
     }
   }
 
+  // Decision 15: the output frame is Image 1's, or HD when Image 1 is not connected (the General
+  // context's default would be the union of all inputs).
+  bool getRegionOfDefinition(const OFX::RegionOfDefinitionArguments& args, OfxRectD& rod) override {
+    if (src_->isConnected()) {
+      rod = src_->getRegionOfDefinition(args.time);
+    } else {
+      rod.x1 = rod.y1 = 0.0;
+      rod.x2 = kDefaultW;
+      rod.y2 = kDefaultH;
+    }
+    return true;
+  }
+
+  // Decision 14: tell Flame what the output is (OFX 1.5, see kOutputs).
+  bool getOutputColourspace(const std::vector<std::string>& preferred, std::string& colourspace) override {
+    LogScope scope(nodeId_);
+    // Decision 15: without Image 1 there is no source colour space to follow.
+    colourspace = outputMode() == kOutDisplay || !src_->isConnected() ? kRec1886Display : kSameAsSource;
+    std::string pref;
+    for (const auto& p : preferred) pref += (pref.empty() ? "" : ", ") + p;
+    LOGI("getOutputColourspace: host prefers [%s] -> %s", pref.c_str(), colourspace.c_str());
+    logColourManagement("getOutputColourspace");
+    return true;
+  }
+
  private:
+  OutputMode outputMode() {
+    int o = 0;
+    output_->getValue(o);
+    return o == kOutSource ? kOutSource : o == kOutBypass ? kOutBypass : kOutDisplay;
+  }
+
+  // The cached variant the Output shows (decision 16): only Source Colour Space with an Image 1
+  // needs the converted one.
+  std::string variant() { return outputMode() == kOutSource && src_->isConnected() ? "source" : "display"; }
+
+  // What the host negotiated (OFX 1.5); empty values = not supported or not set. For the Flame test.
+  void logColourManagement(const char* when) {
+    try {
+      const std::string style = getPropertySet().propGetString(kCmStyle, false);
+      const std::string config = getPropertySet().propGetString(kCmConfig, false);
+      const std::string in = src_->getPropertySet().propGetString(kClipColourspace, false);
+      const std::string out = dst_->getPropertySet().propGetString(kClipColourspace, false);
+      LOGI("colour management (%s): style '%s' config '%s', source clip '%s', output clip '%s'", when, style.c_str(),
+           config.c_str(), in.c_str(), out.c_str());
+    } catch (const std::exception& e) {
+      LOGI("colour management (%s): not available (%s)", when, e.what());
+    }
+  }
+
   void handleParam(const std::string& name) {
-    if (name == kPGenerate) {
+    if (name == kPColour) {
+      // Decision 16: Output follows Input Colour (Bypass in -> Bypass out, else BT.1886); the user
+      // can change Output afterwards. Our setValue comes back as a plugin edit, which is ignored.
+      int c = 0;
+      colour_->getValue(c);
+      output_->setValue(c == 0 ? int(kOutBypass) : int(kOutDisplay));
+      LOGI("Input Colour %s -> Output %s", kColourSpaces[c], kOutputs[c == 0 ? kOutBypass : kOutDisplay]);
+    } else if (name == kPGenerate) {
       generate();
     } else if (name == kPPurgeNode) {
       purgeNode();
@@ -452,13 +531,13 @@ class PartnerEffect : public OFX::ImageEffect {
     }
   }
 
-  // The pop-out editor for a text param: zenity's editable text window, run while Flame waits (the
-  // same as Flame's own popups). zenity prints the edited text on OK (exit 0); Cancel or closing
-  // the window exits 1 and leaves the param unchanged. Its GTK warnings go to /dev/null, so only
-  // the text reaches us. The current text travels in a mode-600 file in the staging folder.
+  // The pop-out editor for a text param (decision 13): worker/edit_text.py under the runtime's
+  // Python opens the OS's editor window (cpo/oslayer.py: zenity on Linux, a Swift window on macOS)
+  // and runs while Flame waits, the same as Flame's own popups. The text travels in a mode-600 file
+  // in the staging folder; exit 0 = saved, 1 = cancelled, 2 = no editor available.
   void editText(const ModelParam& p) {
-    const char* zenity = "/usr/bin/zenity";
-    if (access(zenity, X_OK) != 0) return error("The editor needs zenity (sudo dnf install zenity).");
+    const RuntimeState rt = runtimeState();
+    if (!rt.ready) return error("Install the runtime first (Setup tab).");
     OFX::StringParam* param = fetchStringParam(p.name);
     std::string text;
     param->getValue(text);
@@ -474,34 +553,77 @@ class PartnerEffect : public OFX::ImageEffect {
       }
     }
     std::string err;
-    WorkerProcess z;
+    WorkerProcess ed;
     std::vector<std::string> lines;
-    const bool started = z.start({"/bin/sh", "-c", "exec \"$0\" \"$@\" 2>/dev/null", zenity, "--text-info",
-                                  "--editable", "--title=" + spec_.label + " - " + p.label, "--width=760",
-                                  "--height=440", "--filename=" + tmp},
-                                 cleanEnvironment(), err);
+    const bool started = ed.start({rt.python, "-I", "-B", resourcesDir() + "/worker/edit_text.py", tmp,
+                                   spec_.label + " - " + p.label},
+                                  cleanEnvironment(), err);
     if (started)
-      while (z.readLines(200, lines)) {
+      while (ed.readLines(200, lines)) {
       }
-    const int status = started ? z.wait() : -1;
+    const int status = started ? ed.wait() : -1;
+    const std::string edited = readFile(tmp);
     unlink(tmp.c_str());
+    for (const auto& l : lines) LOGW("editText: %s", l.c_str());
     if (!started) return error("Could not open the editor: " + err);
-    if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
+    const int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (code == 2)
+      return error("No editor available: it needs zenity on Linux (sudo dnf install zenity) or the Command "
+                   "Line Tools on macOS (xcode-select --install).");
+    if (code != 0) {
       LOGI("editText %s: cancelled (status %d)", p.name.c_str(), status);
       return;
     }
-    std::string edited;
-    for (size_t i = 0; i < lines.size(); ++i) edited += (i ? "\n" : "") + lines[i];
     LOGI("editText %s: %zu -> %zu characters", p.name.c_str(), text.size(), edited.size());
     if (edited != text) param->setValue(edited);
   }
 
-  double firstFrame() { return std::floor(src_->getFrameRange().min + 0.5); }
+  static int inputCount(const ModelSpec& spec) { return std::max(1, std::min(spec.maxReferences, kMaxInputs)); }
 
-  bool useSource() {
-    bool v = false;
-    if (useSource_) useSource_->getValue(v);
-    return v;
+  // Decision 15: the connected inputs' first frames (decision 3), in order from Image 1.
+  struct Inputs {
+    std::vector<bool> connected;
+    int count = 0;    // inputs sent to the model
+    int gapAt = -1;   // slot of an input connected after an empty one (an error)
+    std::vector<std::unique_ptr<OFX::Image>> first;  // first frame of each sent input
+    int w = kDefaultW, h = kDefaultH;
+    OfxRectI bounds{0, 0, kDefaultW, kDefaultH};  // the result's place: Image 1's first frame
+  };
+
+  bool gatherInputs(Inputs& in, std::string& err) {
+    for (OFX::Clip* c : inputs_) in.connected.push_back(c->isConnected());
+    in.gapAt = inputOrderError(in.connected);
+    if (in.gapAt >= 0) {
+      err = "Image " + std::to_string(in.gapAt + 1) + " is connected but Image " + std::to_string(in.gapAt) +
+            " is not: connect the inputs in order from Image 1.";
+      return false;
+    }
+    in.count = spec_.maxReferences > 0 ? connectedInputs(in.connected) : 0;
+    for (int i = 0; i < connectedInputs(in.connected); ++i) {
+      OFX::Clip* c = inputs_[size_t(i)];
+      const double first = std::floor(c->getFrameRange().min + 0.5);
+      std::unique_ptr<OFX::Image> img;
+      try {
+        img.reset(c->fetchImage(first));
+      } catch (const std::exception& e) {
+        LOGE("fetchImage(Image %d, %g) threw: %s", i + 1, first, e.what());
+      }
+      if (!img) {
+        err = "Flame did not provide the first frame of Image " + std::to_string(i + 1) + ".";
+        return false;
+      }
+      if (img->getPixelDepth() != OFX::eBitDepthFloat) {
+        err = "Only 32-bit float images are supported (Image " + std::to_string(i + 1) + ").";
+        return false;
+      }
+      if (i == 0) {
+        in.bounds = img->getBounds();
+        in.w = in.bounds.x2 - in.bounds.x1;
+        in.h = in.bounds.y2 - in.bounds.y1;
+      }
+      if (i < in.count) in.first.push_back(std::move(img));
+    }
+    return true;
   }
 
   // The model's param values as strings (model_spec.h).
@@ -533,13 +655,18 @@ class PartnerEffect : public OFX::ImageEffect {
   std::string paramSignature() {
     int colour = 0;
     colour_->getValue(colour);
-    std::string sig = "v1|model=" + spec_.version + "|cs=" + kColourSpaces[colour] + "|src=" + (useSource() ? "1" : "0");
+    // v3: the cache holds the model image + variants (decision 16); Output is not part of the key.
+    std::string sig = "v3|model=" + spec_.version + "|cs=" + kColourSpaces[colour];
     for (const auto& kv : paramValues()) sig += "|" + kv.first + "=" + kv.second;
     return sig;
   }
 
-  std::string currentKey(const OFX::Image& ref) {
-    return resultKey(useSource() ? hashImage(ref) : 0, paramSignature());
+  // Every sent input's first frame, in order, plus the result size (decision 15).
+  std::string currentKey(const Inputs& in) {
+    uint64_t h = 1469598103934665603ULL;
+    for (const auto& img : in.first) h = (h ^ hashImage(*img)) * 1099511628211ULL;
+    return resultKey(h, paramSignature() + "|in=" + std::to_string(in.count) + "|size=" + std::to_string(in.w) +
+                            "x" + std::to_string(in.h));
   }
 
   bool generatedBefore() {
@@ -584,7 +711,9 @@ class PartnerEffect : public OFX::ImageEffect {
   void refreshCost() {
     if (!spec_.costHint) return;
     try {
-      setIfChanged(cost_, spec_.costHint(paramValues(), useSource() ? 1 : 0));
+      int n = 0;
+      for (OFX::Clip* c : inputs_) n += c->isConnected() ? 1 : 0;
+      setIfChanged(cost_, spec_.costHint(paramValues(), std::min(n, spec_.maxReferences)));
     } catch (const std::exception& e) {
       LOGW("refreshCost FAILED: %s", e.what());
     }
@@ -593,8 +722,7 @@ class PartnerEffect : public OFX::ImageEffect {
   // Disable the generating params while the runtime is missing (LTX decision 38).
   void refreshSetupUi() {
     const RuntimeState rt = runtimeState();
-    std::vector<std::string> gated = {kPColour, kPGenerate, kPPurgeNode};
-    if (useSource_) gated.push_back(kPUseSource);
+    std::vector<std::string> gated = {kPColour, kPOutput, kPGenerate, kPPurgeNode};
     for (const auto& p : spec_.params) gated.push_back(p.name);
     for (const auto& p : gated) {
       try {
@@ -614,7 +742,7 @@ class PartnerEffect : public OFX::ImageEffect {
     sendMessage(OFX::Message::eMessageError, "", msg);
   }
 
-  // Stages the reference frame (float32 RGB, rows top-down) for job.py. Plain write(), no mmap
+  // Stages one input's first frame (float32 RGB, rows top-down) for job.py. Plain write(), no mmap
   // (LTX transport.h: a full tmpfs must fail with ENOSPC, not SIGBUS inside Flame).
   bool stageFrame(const OFX::Image& img, const std::string& path, std::string& err) {
     const OfxRectI b = img.getBounds();
@@ -632,7 +760,7 @@ class PartnerEffect : public OFX::ImageEffect {
       return false;
     }
     const size_t rowBytes = size_t(w) * 3 * sizeof(float);
-    bool ok = posix_fallocate(fd, 0, off_t(sizeof hdr + rowBytes * size_t(h))) == 0 &&
+    bool ok = reserveFile(fd, (long long)(sizeof hdr + rowBytes * size_t(h))) == 0 &&
               write(fd, &hdr, sizeof hdr) == ssize_t(sizeof hdr);
     std::vector<float> row(size_t(w) * 3);
     for (int r = 0; ok && r < h; ++r) {
@@ -652,22 +780,14 @@ class PartnerEffect : public OFX::ImageEffect {
     if (!rt.ready) return error("Install the runtime first (Setup tab).");
     const std::string key = apiKey();
     if (key.empty()) return error("No Comfy API key: enter yours in the Setup tab and press Save Key.");
-    const double first = firstFrame();
-    std::unique_ptr<OFX::Image> ref;
-    try {
-      ref.reset(src_->fetchImage(first));
-    } catch (const std::exception& e) {
-      LOGE("generate: fetchImage(%g) threw: %s", first, e.what());
-    }
-    if (!ref) return error("Flame did not provide the source's first frame.");
-    if (ref->getPixelDepth() != OFX::eBitDepthFloat) return error("Only 32-bit float images are supported.");
-    const OfxRectI b = ref->getBounds();
-    const int w = b.x2 - b.x1, h = b.y2 - b.y1;
+    Inputs in;
+    std::string err;
+    if (!gatherInputs(in, err)) return error(err);
     const std::string root = cacheRoot();
-    const std::string rkey = currentKey(*ref);
+    const std::string rkey = currentKey(in);
     if (isPending(root, rkey)) return error("This node is already generating these settings.");
     std::vector<uint16_t> existing;
-    if (readResult(root, rkey, uint32_t(w), uint32_t(h), existing)) {
+    if (readResult(root, rkey, "display", uint32_t(in.w), uint32_t(in.h), existing)) {
       // Every run costs credits: an unanswered question never spends them.
       const auto reply = sendMessage(OFX::Message::eMessageQuestion, "",
                                      "A result for exactly these settings is already cached.\n\nGenerate "
@@ -679,18 +799,49 @@ class PartnerEffect : public OFX::ImageEffect {
     const std::string jobId = std::to_string(getpid()) + "-" + std::to_string(gJobSeq++) + "-" +
                               std::to_string(std::time(nullptr));
     LogScope scope(nodeId_, jobId);
-    const bool withSource = useSource();
-    const std::string input = stagingDir() + "/cpo_job_" + jobId + "_in.bin";
-    std::string err;
-    if (withSource && !stageFrame(*ref, input, err)) return error(err);
     int colour = 0;
     colour_->getValue(colour);
     const ParamValues values = paramValues();
+    // Decision 17: say before spending credits when inputs will be scaled down to the model's limit.
+    const long long limit = spec_.referencePixels ? spec_.referencePixels(values) : 0;
+    std::string scaled;
+    for (size_t i = 0; limit > 0 && i < in.first.size(); ++i) {
+      const OfxRectI b = in.first[i]->getBounds();
+      const long long w = b.x2 - b.x1, h = b.y2 - b.y1;
+      if (w * h <= limit) continue;
+      const double f = std::sqrt(double(limit) / double(w * h));  // as job.py's imageio.to_png
+      char line[160];
+      std::snprintf(line, sizeof line, "Image %zu: %lldx%lld (%.1f MP) -> about %dx%d\n", i + 1, w, h, w * h / 1e6,
+                    int(double(w) * f), int(double(h) * f));
+      scaled += line;
+    }
+    if (!scaled.empty()) {
+      char head[200];
+      std::snprintf(head, sizeof head, "%s at this resolution takes up to %.1f MP per image, so these inputs will be "
+                    "scaled down before upload:\n\n", spec_.label.c_str(), limit / 1e6);
+      const auto reply = sendMessage(OFX::Message::eMessageQuestion, "",
+                                     std::string(head) + scaled + "\nContinue? (No: scale them yourself upstream.)");
+      LOGI("generate: inputs over %lld pixels:\n%s reply %d (0 OK, 1 Yes, 2 No, 3 Failed)", limit, scaled.c_str(),
+           int(reply));
+      if (reply == OFX::Message::eMessageReplyNo) return;
+      if (reply != OFX::Message::eMessageReplyYes)  // the host didn't ask (LTX decision 56 fallback)
+        setPersistentMessage(OFX::Message::eMessageWarning, "",
+                             "Inputs were scaled down to " + spec_.label + "'s limit before upload (see the log).");
+    }
+    std::vector<std::string> staged;
+    for (size_t i = 0; i < in.first.size(); ++i) {
+      staged.push_back(stagingDir() + "/cpo_job_" + jobId + "_in" + std::to_string(i + 1) + ".bin");
+      if (!stageFrame(*in.first[i], staged.back(), err)) {
+        for (const auto& f : staged) unlink(f.c_str());
+        return error(err);
+      }
+    }
     std::ostringstream js;
     js << "{\"job_id\":" << jsonStr(jobId) << ",\"node_id\":" << jsonStr(nodeId_)
-       << ",\"model\":" << jsonStr(spec_.module) << ",\"label\":" << jsonStr(spec_.label)
-       << ",\"input\":" << jsonStr(withSource ? input : "") << ",\"width\":" << w << ",\"height\":" << h
-       << ",\"colour\":" << jsonStr(kColourSpaces[colour]) << ",\"ocio_config\":\"\",\"params\":{";
+       << ",\"model\":" << jsonStr(spec_.module) << ",\"label\":" << jsonStr(spec_.label) << ",\"inputs\":[";
+    for (size_t i = 0; i < staged.size(); ++i) js << (i ? "," : "") << jsonStr(staged[i]);
+    js << "],\"width\":" << in.w << ",\"height\":" << in.h << ",\"colour\":" << jsonStr(kColourSpaces[colour])
+       << ",\"ocio_config\":\"\",\"reference_pixels\":" << limit << ",\"params\":{";
     bool firstParam = true;
     for (const auto& kv : values) {
       js << (firstParam ? "" : ",") << jsonStr(kv.first) << ":" << jsonStr(kv.second);
@@ -713,7 +864,7 @@ class PartnerEffect : public OFX::ImageEffect {
                                    cleanEnvironment({"CPO_LOG_LEVEL=" + level, "COMFY_API_KEY=" + key}), err);
     if (!ok) {
       clearPending(root, rkey);
-      unlink(input.c_str());
+      for (const auto& f : staged) unlink(f.c_str());
       unlink(manifest.c_str());
       return error("Could not start Generate: " + err);
     }
@@ -721,10 +872,9 @@ class PartnerEffect : public OFX::ImageEffect {
       std::lock_guard<std::mutex> lock(jobMutex_);
       lastJobId_ = jobId;
     }
-    LOGI("generate: job launched: %dx%d first frame %g, source %s, API key (%zu characters), "
-         "colour %s, params %s; %s",
-         w, h, first, withSource ? "as reference" : "not used", key.size(),
-         kColourSpaces[colour], paramSignature().c_str(), spec_.costHint ? spec_.costHint(values, withSource).c_str() : "");
+    LOGI("generate: job launched: %dx%d, %d input(s), API key (%zu characters), colour %s, params %s; %s",
+         in.w, in.h, in.count, key.size(), kColourSpaces[colour],
+         paramSignature().c_str(), spec_.costHint ? spec_.costHint(values, in.count).c_str() : "");
     setIfChanged(status_, "Generating...");
     startWatcher(jobId, root, rkey);
   }
@@ -865,11 +1015,12 @@ class PartnerEffect : public OFX::ImageEffect {
   }
 
   const ModelSpec& spec_;
+  std::vector<OFX::Clip*> inputs_;  // Image 1..n (decision 15); inputs_[0] is src_
   OFX::Clip* src_;
   OFX::Clip* dst_;
   OFX::ChoiceParam* colour_;
   OFX::StringParam* status_;
-  OFX::BooleanParam* useSource_;
+  OFX::ChoiceParam* output_;
   OFX::StringParam* cacheDir_;
   OFX::StringParam* cacheInfo_;
   OFX::StringParam* cost_;
@@ -917,7 +1068,9 @@ void describeEffect(OFX::ImageEffectDescriptor& desc, const ModelSpec& spec) {
   LOGI("describe %s (%s)", spec.label.c_str(), spec.pluginId.c_str());
   desc.setLabels(spec.label, spec.label, spec.label);
   desc.setPluginGrouping("Partner Models");
-  desc.addSupportedContext(OFX::eContextFilter);  // LTX 63: Filter only, one source
+  // Decision 15: several optional inputs need the General context (LTX 63 found Flame offers extra
+  // clips only there); nodes made with the 0.1/0.2 Filter context must be re-created.
+  desc.addSupportedContext(OFX::eContextGeneral);
   desc.addSupportedBitDepth(OFX::eBitDepthFloat);
   desc.setSingleInstance(false);
   desc.setHostFrameThreading(false);
@@ -927,15 +1080,24 @@ void describeEffect(OFX::ImageEffectDescriptor& desc, const ModelSpec& spec) {
   desc.setRenderTwiceAlways(false);
   desc.setSupportsMultipleClipPARs(false);
   desc.setRenderThreadSafety(OFX::eRenderInstanceSafe);
+  // Decision 14: OFX 1.5 colour management, Core style with the OFX native config. A 1.4 host
+  // ignores unknown properties (no throw).
+  desc.getPropertySet().propSetString(kCmStyle, kCmStyleCore, false);
+  desc.getPropertySet().propSetString(kCmConfigs, kCmNativeConfig, 0, false);
 }
 
 void describeEffectInContext(OFX::ImageEffectDescriptor& desc, OFX::ContextEnum ctx, const ModelSpec& spec) {
   try {
-    OFX::ClipDescriptor* src = desc.defineClip(kOfxImageEffectSimpleSourceClipName);
-    src->addSupportedComponent(OFX::ePixelComponentRGBA);
-    src->addSupportedComponent(OFX::ePixelComponentRGB);
-    src->setTemporalClipAccess(true);
-    src->setSupportsTiles(false);
+    for (int i = 0; i < std::max(1, std::min(spec.maxReferences, kMaxInputs)); ++i) {  // decision 15
+      OFX::ClipDescriptor* c = desc.defineClip(inputClipName(i));
+      const std::string label = "Image " + std::to_string(i + 1);
+      c->setLabels(label, label, label);
+      c->addSupportedComponent(OFX::ePixelComponentRGBA);
+      c->addSupportedComponent(OFX::ePixelComponentRGB);
+      c->setTemporalClipAccess(true);
+      c->setSupportsTiles(false);
+      c->setOptional(true);
+    }
     OFX::ClipDescriptor* dst = desc.defineClip(kOfxImageEffectOutputClipName);
     dst->addSupportedComponent(OFX::ePixelComponentRGBA);
     dst->setSupportsTiles(false);
@@ -983,20 +1145,11 @@ void describeEffectInContext(OFX::ImageEffectDescriptor& desc, OFX::ContextEnum 
     colour->setEvaluateOnChange(false);
     place(*colour, gMain);
     place(*button(kPGenerate, "Generate",
-                  "Send the source's first frame and the prompt to " + spec.label +
-                      " (costs credits). The result is held on every frame. Progress and Cancel appear "
-                      "in a separate window."),
+                  "Send the prompt and the first frame of each connected input (Image 1, 2, ... in "
+                  "order) to " + spec.label + " (costs credits). The result is held on every frame. "
+                  "Progress and Cancel appear in a separate window."),
           gMain);
     place(*label(kPStatus, "Status", "Not generated"), gMain);
-    if (spec.maxReferences > 0) {
-      auto* use = labelled(desc.defineBooleanParam(kPUseSource), "Use Source",
-                           "Send the source's first frame as the reference image (@Image1). Off: "
-                           "generate from the prompt alone.");
-      use->setDefault(true);
-      use->setEvaluateOnChange(false);
-      place(*use, gMain);
-    }
-
     // --- Model columns ---
     std::vector<OFX::GroupParamDescriptor*> modelGroups;
     for (size_t c = 0; c < spec.columns.size(); ++c)
@@ -1047,14 +1200,27 @@ void describeEffectInContext(OFX::ImageEffectDescriptor& desc, OFX::ContextEnum 
     place(*button(kPPurgeNode, "Purge Cache", "Delete this node's cached result."), gCache);
     place(*button(kPPurgeAll, "Purge All", "Delete every cached result of every node and project."), gCache);
 
-    // --- Cost (1 row) and spacers up to 6 columns; the last one holds the version, so a test in
-    // Flame shows which build is loaded (LTX decision 52). ---
-    place(*label(kPCost, "Cost", ""), group("grpCost", "Cost", main));
-    for (int spacer = 0; columns < 5; ++spacer) {
-      const std::string n = std::to_string(spacer);
+    // --- Result (2 rows): output colour (decisions 14/16) ---
+    auto* gResult = group("grpResult", "Result", main);
+    auto* out = labelled(desc.defineChoiceParam(kPOutput), "Output",
+                         "BT.1886 Display: the model's image as it came, tagged Rec.1886 Rec.709 for Flame's "
+                         "colour management. Source Colour Space: converted back to the Input Colour (SDR-"
+                         "limited). Bypass: the model's image untouched, no colour handling. Switching needs no "
+                         "new Generate. Follows Input Colour when that changes.");
+    for (const char* o : kOutputs) out->appendOption(o);
+    out->setDefault(kOutBypass);  // Input Colour's default is Bypass
+    out->setEvaluateOnChange(true);  // a different cached variant
+    place(*out, gResult);
+    // Spacers up to 6 columns, so the Setup tab overflows to tab 2 (LTX decision 52).
+    int spacer = 0;
+    while (columns < 5) {  // group() counts the column
+      const std::string n = std::to_string(spacer++);
       place(*label("spacer" + n, " ", " "), group("grpSpacer" + n, " ", main));
     }
-    place(*label("version", "Version", std::string(CPO_VERSION) + " (" + CPO_GIT + ")"), group("grpVersion", " ", main));
+    // The last column: the Version (so a test in Flame shows which build is loaded) and the Cost.
+    auto* gLast = group("grpVersion", " ", main);
+    place(*label("version", "Version", std::string(CPO_VERSION) + " (" + CPO_GIT + ")"), gLast);
+    place(*label(kPCost, "Cost", ""), gLast);
 
     // --- Setup tab: API key (4 rows, per user) ---
     auto* gKey = group("grpKey", "API Key", setupPage);

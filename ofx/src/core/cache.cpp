@@ -13,6 +13,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <map>
 
 #include "platform.h"
 
@@ -42,7 +43,38 @@ int readPid(const std::string& path) {
   return pid;
 }
 
-constexpr const char* kExt = ".img";
+// A cache file: "<16 hex>.<anything>" in a 2-character folder; the key is the part before the dot.
+bool cacheFile(const std::string& f, std::string& key) {
+  const auto dot = f.find('.');
+  if (dot != 16 || f.find(".tmp") != std::string::npos) return false;
+  key = f.substr(0, dot);
+  return true;
+}
+
+struct KeyFiles {
+  std::vector<std::string> paths;
+  time_t newest = 0;
+  uint64_t bytes = 0;
+};
+
+// Every key in the cache with its files (decision 16).
+std::map<std::string, KeyFiles> scanKeys(const std::string& root) {
+  std::map<std::string, KeyFiles> keys;
+  for (const auto& sub : listDir(root)) {
+    if (sub.size() != 2) continue;
+    for (const auto& f : listDir(root + "/" + sub)) {
+      std::string key;
+      struct stat st {};
+      const std::string p = root + "/" + sub + "/" + f;
+      if (!cacheFile(f, key) || stat(p.c_str(), &st) != 0) continue;
+      KeyFiles& k = keys[key];
+      k.paths.push_back(p);
+      k.newest = std::max(k.newest, st.st_mtime);
+      k.bytes += uint64_t(st.st_size);
+    }
+  }
+  return keys;
+}
 
 }  // namespace
 
@@ -70,17 +102,17 @@ std::string resultKey(uint64_t sourceFrameHash, const std::string& paramSignatur
   return buf;
 }
 
-std::string resultPath(const std::string& root, const std::string& key) {
-  return root + "/" + key.substr(0, 2) + "/" + key + kExt;
+std::string resultPath(const std::string& root, const std::string& key, const std::string& variant) {
+  return root + "/" + key.substr(0, 2) + "/" + key + "." + variant + ".img";
 }
 
 std::string pendingPath(const std::string& root, const std::string& key) {
   return root + "/pending/" + key;
 }
 
-bool readResult(const std::string& root, const std::string& key, uint32_t w, uint32_t h,
-                std::vector<uint16_t>& out) {
-  const std::string path = resultPath(root, key);
+bool readResult(const std::string& root, const std::string& key, const std::string& variant, uint32_t w,
+                uint32_t h, std::vector<uint16_t>& out) {
+  const std::string path = resultPath(root, key, variant);
   const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) return false;
   FrameFileHeader hdr{};
@@ -116,62 +148,53 @@ void markPending(const std::string& root, const std::string& key, int pid) {
 void clearPending(const std::string& root, const std::string& key) { unlink(pendingPath(root, key).c_str()); }
 
 bool purgeKey(const std::string& root, const std::string& key) {
-  return unlink(resultPath(root, key).c_str()) == 0;
+  bool any = false;
+  const std::string dir = root + "/" + key.substr(0, 2);
+  for (const auto& f : listDir(dir)) {
+    std::string k;
+    if (cacheFile(f, k) && k == key && unlink((dir + "/" + f).c_str()) == 0) any = true;
+  }
+  return any;
 }
 
 uint64_t cacheBytes(const std::string& root) {
   uint64_t total = 0;
-  for (const auto& sub : listDir(root)) {
-    if (sub.size() != 2) continue;
-    for (const auto& f : listDir(root + "/" + sub)) {
-      struct stat st {};
-      if (endsWith(f, kExt) && stat((root + "/" + sub + "/" + f).c_str(), &st) == 0)
-        total += uint64_t(st.st_size);
-    }
-  }
+  for (const auto& kv : scanKeys(root)) total += kv.second.bytes;
   return total;
 }
 
 uint64_t purgeAll(const std::string& root) {
   uint64_t freed = 0;
-  for (const auto& sub : listDir(root)) {
-    if (sub.size() != 2) continue;
-    for (const auto& f : listDir(root + "/" + sub)) {
-      const std::string p = root + "/" + sub + "/" + f;
+  for (const auto& kv : scanKeys(root))
+    for (const auto& p : kv.second.paths) {
       struct stat st {};
-      if (endsWith(f, kExt) && stat(p.c_str(), &st) == 0 && unlink(p.c_str()) == 0)
-        freed += uint64_t(st.st_size);
+      if (stat(p.c_str(), &st) == 0 && unlink(p.c_str()) == 0) freed += uint64_t(st.st_size);
     }
-  }
   return freed;
 }
 
 SweepResult sweepCache(const CacheSettings& s) {
   SweepResult r;
   struct Entry {
-    std::string path;
+    std::vector<std::string> paths;
     time_t mtime;
     uint64_t size;
   };
   std::vector<Entry> entries;
   const time_t now = time(nullptr);
   const time_t maxAge = time_t(s.maxAgeDays) * 86400;
-  for (const auto& sub : listDir(s.root)) {
-    if (sub.size() != 2) continue;
-    for (const auto& f : listDir(s.root + "/" + sub)) {
-      if (!endsWith(f, kExt)) continue;
-      const std::string p = s.root + "/" + sub + "/" + f;
-      struct stat st {};
-      if (stat(p.c_str(), &st) != 0) continue;
-      if (s.maxAgeDays > 0 && now - st.st_mtime > maxAge) {
-        if (unlink(p.c_str()) == 0) {
-          ++r.aged;
-          r.bytesFreed += uint64_t(st.st_size);
-        }
-        continue;
-      }
-      entries.push_back({p, st.st_mtime, uint64_t(st.st_size)});
+  auto remove = [](const Entry& e) {
+    for (const auto& p : e.paths) unlink(p.c_str());
+  };
+  for (const auto& kv : scanKeys(s.root)) {  // a key's files go together (decision 16)
+    Entry e{kv.second.paths, kv.second.newest, kv.second.bytes};
+    if (s.maxAgeDays > 0 && now - e.mtime > maxAge) {
+      remove(e);
+      ++r.aged;
+      r.bytesFreed += e.size;
+      continue;
     }
+    entries.push_back(e);
   }
   uint64_t total = 0;
   for (const auto& e : entries) total += e.size;
@@ -181,11 +204,10 @@ SweepResult sweepCache(const CacheSettings& s) {
               [](const Entry& a, const Entry& b) { return a.mtime < b.mtime; });  // oldest first
     for (const auto& e : entries) {
       if (total <= cap) break;
-      if (unlink(e.path.c_str()) == 0) {
-        total -= e.size;
-        ++r.capped;
-        r.bytesFreed += e.size;
-      }
+      remove(e);
+      total -= e.size;
+      ++r.capped;
+      r.bytesFreed += e.size;
     }
   }
   r.bytesKept = total;

@@ -24,7 +24,7 @@ ModelSpec make() {
   s.label = "Nano Banana Pro";
   s.module = "nano_banana_pro";
   s.version = "nbpro-router-v1";
-  s.maxReferences = 1;
+  s.maxReferences = 5;  // Image 1..5 (decision 15); Gemini accepts up to 14
   s.columns = {"Prompt", "Output"};
   s.params.push_back(modelParam(ParamKind::Text, "prompt", "Prompt",
                                 "The image to create, or the edit to make to the source (@Image1).", 0));
@@ -43,6 +43,12 @@ ModelSpec make() {
   res.options = {"1K", "2K", "4K"};
   s.params.push_back(res);
   s.costHint = cost;
+  // Ours (ComfyUI uploads Gemini references at full size): the output's pixel budget, which keeps
+  // the inline base64 request well under Router's 100 MiB.
+  s.referencePixels = [](const ParamValues& v) -> long long {
+    const std::string r = v.count("resolution") ? v.at("resolution") : "1K";
+    return r == "1K" ? 1024LL * 1024 : r == "2K" ? 2048LL * 2048 : 4096LL * 4096;
+  };
   return s;
 }
 

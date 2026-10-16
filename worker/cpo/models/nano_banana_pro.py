@@ -8,10 +8,6 @@ from . import gemini
 MODEL_ID = "vertexai/gemini-3-pro-image"
 
 
-def reference_pixels(params: dict) -> int:
-    return {"1K": 1024 * 1024, "2K": 2048 * 2048}.get(params.get("resolution"), 4096 * 4096)
-
-
 def build_request(router, params: dict, refs: list, log) -> dict:
     return gemini.build_body(params, refs)
 

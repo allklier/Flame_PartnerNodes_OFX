@@ -4,8 +4,8 @@ Linux: zenity windows and /proc. Standard library only (setup_helper.py and job.
 system python3).
 
 macOS: the progress window is mac_progress.swift, a small AppKit program that reads zenity's
-stdin protocol, compiled once with swiftc (Command Line Tools, which Setup requires) into
-~/.cache/partner-models-ofx/bin. Chosen over the alternatives on a stock macOS 15: AppleScript's
+stdin protocol, and the prompt editor is mac_editor.swift; both compiled once with swiftc (Command
+Line Tools, which Setup requires) into ~/.cache/partner-models-ofx/bin. Chosen over the alternatives on a stock macOS 15: AppleScript's
 "progress" properties draw nothing when run by osascript (only in applets/Script Editor); the
 system python3's tkinter (Tk 8.5) aborts at Tk() ("macOS 15 (1507) or later required"); a JXA
 (osascript -l JavaScript) Cocoa window works but needs the untyped ObjC bridge for the button
@@ -65,31 +65,65 @@ class ProgressWindow:
                 self.proc.wait(timeout=wait)
 
 
-def _mac_progress_helper() -> str:
-    """Path of the compiled mac_progress.swift, built on first use (one binary per source version;
-    the first build takes ~1 min while swiftc fills its module cache). "" if it can't be built:
-    then there is no window, as on Linux without zenity. Build errors go to the log folder."""
-    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mac_progress.swift")
+def _mac_helper(name: str) -> str:
+    """Path of the compiled <name>.swift next to this file (mac_progress, mac_editor), built on first
+    use (one binary per source version; the first build takes ~1 min while swiftc fills its module
+    cache, so Install builds them up front: prebuild_mac_helpers). "" if it can't be built. Build
+    errors go to the log folder."""
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{name}.swift")
     try:
         with open(src, "rb") as f:
-            exe = os.path.expanduser(f"~/.cache/partner-models-ofx/bin/cpo_progress-"
+            exe = os.path.expanduser(f"~/.cache/partner-models-ofx/bin/cpo_{name}-"
                                      f"{hashlib.sha256(f.read()).hexdigest()[:12]}")
         if os.path.exists(exe):
             return exe
         os.makedirs(os.path.dirname(exe), exist_ok=True)
-        tmp = f"{exe}.{os.getpid()}.tmp"  # two jobs may build at once; os.replace is atomic
+        tmp = f"{exe}.{os.getpid()}.tmp"  # two processes may build at once; os.replace is atomic
         r = subprocess.run(["/usr/bin/xcrun", "swiftc", "-O", "-o", tmp, src], capture_output=True,
                            text=True, timeout=600)
         if r.returncode != 0:
             logs = os.path.expanduser("~/.cache/partner-models-ofx/logs")
             os.makedirs(logs, exist_ok=True)
-            with open(os.path.join(logs, "mac_progress_build.log"), "w") as f:
+            with open(os.path.join(logs, f"{name}_build.log"), "w") as f:
                 f.write(r.stdout + r.stderr)
             return ""
         os.replace(tmp, exe)
         return exe
     except (OSError, subprocess.SubprocessError):
         return ""
+
+
+def _mac_progress_helper() -> str:
+    return _mac_helper("mac_progress")
+
+
+def prebuild_mac_helpers() -> list:
+    """Install: build the Swift helpers now. Returns the names that failed (empty off macOS)."""
+    if sys.platform != "darwin":
+        return []
+    return [n for n in ("mac_progress", "mac_editor") if not _mac_helper(n)]
+
+
+def edit_text(path: str, title: str) -> int:
+    """Decision 13: a resizable editor for the text in `path`, waiting until it closes.
+    0: saved (the file holds the new text), 1: cancelled, 2: no editor available.
+    Linux: zenity --text-info --editable prints the edited text on OK (exit 0); its GTK warnings go
+    to /dev/null. macOS: mac_editor.swift edits the file in place."""
+    if sys.platform == "darwin":
+        exe = _mac_helper("mac_editor")
+        if not exe:
+            return 2
+        return 0 if subprocess.run([exe, path, title]).returncode == 0 else 1
+    zenity = shutil.which("zenity")
+    if not zenity:
+        return 2
+    r = subprocess.run([zenity, "--text-info", "--editable", f"--title={title}", "--width=760", "--height=440",
+                        f"--filename={path}"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if r.returncode != 0:
+        return 1
+    with open(path, "wb") as f:
+        f.write(r.stdout.rstrip(b"\n"))
+    return 0
 
 
 def message(kind: str, title: str, text: str, width: int, enabled: bool) -> None:

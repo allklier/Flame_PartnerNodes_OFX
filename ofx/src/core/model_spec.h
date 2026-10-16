@@ -40,6 +40,9 @@ struct ModelSpec {
   std::vector<ModelParam> params;
   // Price per run in USD for the Cost label, from the current values ("" = unknown).
   std::string (*costHint)(const ParamValues& values, int references) = nullptr;
+  // Most pixels an input is sent at (larger ones are scaled down by job.py, which gets the number in
+  // the manifest); Generate warns first (decision 17). 0 = no limit.
+  long long (*referencePixels)(const ParamValues& values) = nullptr;
 };
 
 // A ModelParam with the common fields set (models/registry.cpp).

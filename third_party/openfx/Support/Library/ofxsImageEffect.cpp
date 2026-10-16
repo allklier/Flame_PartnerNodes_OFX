@@ -1537,6 +1537,12 @@ namespace OFX {
     return false;
   }
 
+  // [Partner Models patch] OFX 1.5 colour management, see the header.
+  bool ImageEffect::getOutputColourspace(const std::vector<std::string> &/*preferred*/, std::string &/*colourspace*/)
+  {
+    return false;
+  }
+
 #ifdef OFX_SUPPORTS_OPENGLRENDER
   /** @brief OpenGL context attached */
   void ImageEffect::contextAttached(void)
@@ -2717,6 +2723,23 @@ namespace OFX {
           // call the instance changed action
           if(getTimeDomainAction(handle, outArgs))
             stat = kOfxStatOK;
+        }
+        else if(action == "OfxImageEffectActionGetOutputColourspace") {
+          // [Partner Models patch] OFX 1.5 (ofxColour.h kOfxImageEffectActionGetOutputColourspace);
+          // property names from ofxColour.h, not in the 1.4 headers.
+          checkMainHandles(actionRaw, handleRaw, inArgsRaw, outArgsRaw, false, true, false);
+          ImageEffect *instance = retrieveImageEffectPointer(handle);
+          std::vector<std::string> preferred;
+          if(inArgsRaw) {
+            const int n = inArgs.propGetDimension("OfxImageClipPropPreferredColourspaces", false);
+            for(int i = 0; i < n; ++i)
+              preferred.push_back(inArgs.propGetString("OfxImageClipPropPreferredColourspaces", i, false));
+          }
+          std::string colourspace;
+          if(instance->getOutputColourspace(preferred, colourspace)) {
+            outArgs.propSetString("OfxImageClipPropColourspace", colourspace, 0);
+            stat = kOfxStatOK;
+          }
         }
         else if(action == kOfxActionBeginInstanceChanged) {
           checkMainHandles(actionRaw, handleRaw, inArgsRaw, outArgsRaw, false, false, true);

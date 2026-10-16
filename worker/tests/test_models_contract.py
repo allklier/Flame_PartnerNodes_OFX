@@ -74,7 +74,7 @@ class ModelsContractTest(unittest.TestCase):
             with self.subTest(model=spec["label"]):
                 mod = models.load(spec["module"])
                 self.assertIn(spec["module"], model_fixtures.FIXTURES, "add a fixture in tests/model_fixtures.py")
-                for name in ("MODEL_ID", "reference_pixels", "build_request", "result_images"):
+                for name in ("MODEL_ID", "build_request", "result_images"):
                     self.assertTrue(hasattr(mod, name), name)
                 params = TrackingParams(default_params(spec))
 
@@ -88,31 +88,32 @@ class ModelsContractTest(unittest.TestCase):
 
     def test_end_to_end(self):
         for spec in self.specs:
-            for with_source in ([True, False] if spec["maxReferences"] else [False]):
-                with self.subTest(model=spec["label"], source=with_source):
-                    self.run_job(spec, with_source)
+            for n in sorted({0, min(2, spec["maxReferences"])}):  # no input, and two (decision 15)
+                with self.subTest(model=spec["label"], inputs=n):
+                    self.run_job(spec, n)
 
-    def run_job(self, spec, with_source):
+    def run_job(self, spec, n_inputs):
         fake = FakeRouter()
         fake.response = lambda: model_fixtures.FIXTURES[spec["module"]](fake)
         with tempfile.TemporaryDirectory() as tmp:
             staging, root = os.path.join(tmp, "staging"), os.path.join(tmp, "cache")
             os.makedirs(staging)
             job, w, h = "9-0-1", 40, 24
-            inp = ""
-            if with_source:
-                inp = os.path.join(staging, f"cpo_job_{job}_in.bin")
-                with open(inp, "wb") as f:
+            inputs = []
+            for i in range(n_inputs):
+                path = os.path.join(staging, f"cpo_job_{job}_in{i + 1}.bin")
+                with open(path, "wb") as f:
                     f.write(struct.pack("<4sIIIII", b"CPOA", 1, w, h, 1, 3))
                     # noise: an incompressible PNG, so leaked image data would be long enough to spot
-                    np.random.default_rng(0).random((h, w, 3), np.float32).tofile(f)
+                    np.random.default_rng(i).random((h, w, 3), np.float32).tofile(f)
+                inputs.append(path)
             params = default_params(spec)
-            if not with_source:
+            if not n_inputs:
                 params["prompt"] = "a fox in the snow"
             manifest = os.path.join(staging, f"cpo_job_{job}.json")
             with open(manifest, "w") as f:
                 json.dump({"job_id": job, "node_id": "n", "model": spec["module"], "label": spec["label"],
-                           "input": inp, "width": w, "height": h, "colour": "Bypass", "ocio_config": "",
+                           "inputs": inputs, "width": w, "height": h, "colour": "Bypass", "ocio_config": "",
                            "params": params, "cache_root": root, "key": "00aa00aa00aa00aa", "flame_pid": 0,
                            "title": "t"}, f)
             env = dict(os.environ, HOME=tmp, CPO_ROUTER_BASE=fake.base, COMFY_API_KEY=KEY)
@@ -122,8 +123,10 @@ class ModelsContractTest(unittest.TestCase):
             with open(os.path.join(root, "jobs", f"{job}.json")) as f:
                 status = json.load(f)
             self.assertEqual(status["state"], "done", f"{status} {p.stderr[-500:]}")
-            with open(os.path.join(root, "00", "00aa00aa00aa00aa.img"), "rb") as f:
-                self.assertEqual(struct.unpack("<4sIIIII", f.read(24)), (b"CPOI", 1, w, h, 1, 3))
+            for variant in ("display", "source"):
+                with open(os.path.join(root, "00", f"00aa00aa00aa00aa.{variant}.img"), "rb") as f:
+                    self.assertEqual(struct.unpack("<4sIIIII", f.read(24)), (b"CPOI", 1, w, h, 1, 3))
+            self.assertEqual(len([f for f in os.listdir(os.path.join(root, "00")) if ".model." in f]), 1)
             self.assertEqual(os.listdir(staging), [])
             # LTX decision 39: no image data in the log (a request body with inline base64 leaked once).
             with open(os.path.join(tmp, ".cache/partner-models-ofx/logs/partner-models.log")) as f:

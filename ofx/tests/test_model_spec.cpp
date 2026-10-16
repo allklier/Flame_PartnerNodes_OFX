@@ -5,6 +5,7 @@
 #include <set>
 #include <string>
 
+#include "inputs.h"
 #include "model_spec.h"
 
 static int failures = 0;
@@ -25,8 +26,10 @@ static int rows(cpo::ParamKind k) {
 static void checkSpec(const cpo::ModelSpec& s) {
   CHECK(!s.pluginId.empty() && !s.label.empty() && !s.module.empty() && !s.version.empty());
   CHECK(!s.columns.empty() && s.columns.size() <= 3);  // main + model + cache + cost + version <= 6
-  std::set<std::string> names = {"colourSpace", "generate", "status", "useSource", "cacheDir", "cacheInfo",
-                                 "purgeCache", "purgeAll", "costInfo", "version", "nodeId", "resultKey"};
+  CHECK(s.maxReferences >= 0 && s.maxReferences <= cpo::kMaxInputs);
+  std::set<std::string> names = {"colourSpace", "generate", "status", "cacheDir", "cacheInfo",
+                                 "purgeCache", "purgeAll", "costInfo", "version", "nodeId", "resultKey",
+                                 "outputColour"};
   std::vector<int> used(s.columns.size(), 0);
   for (const auto& p : s.params) {
     CHECK(names.insert(p.name).second);  // unique, and no clash with the core's params
@@ -56,8 +59,17 @@ int main(int argc, char** argv) {
       CHECK(stat(py.c_str(), &st) == 0);
     }
   }
+  // Decision 15: inputs fill in order from Image 1.
+  CHECK(cpo::inputOrderError({false, false, false, false, false}) == -1);
+  CHECK(cpo::inputOrderError({true, true, false, false, false}) == -1);
+  CHECK(cpo::inputOrderError({false, true, false, false, false}) == 1);  // Image 2 without Image 1
+  CHECK(cpo::inputOrderError({true, false, true, false, false}) == 2);
+  CHECK(cpo::connectedInputs({true, true, true, false, false}) == 3);
+  CHECK(cpo::connectedInputs({false, false, false, false, false}) == 0);
+  CHECK(cpo::inputClipName(0) == "Source" && cpo::inputClipName(4) == "Image5");
+
   const cpo::ModelSpec& k = cpo::krea3Spec();
-  CHECK(k.module == "krea3" && k.maxReferences == 1);
+  CHECK(k.module == "krea3" && k.maxReferences == 5);
   // Cost from ComfyUI's Krea3ImageNode price badge.
   CHECK(k.costHint({{"resolution", "1K"}, {"thinkingMode", "fast"}}, 0) == "~$0.043 per run");
   CHECK(k.costHint({{"resolution", "1K"}, {"thinkingMode", "high"}}, 1) == "~$0.100 per run");
@@ -67,6 +79,9 @@ int main(int argc, char** argv) {
   const cpo::ModelSpec& n = cpo::nanoBananaProSpec();
   CHECK(n.costHint({{"resolution", "2K"}}, 1) == "~$0.161 per run");
   CHECK(n.costHint({{"resolution", "4K"}}, 0) == "~$0.288 per run");
+  // Decision 17: the input limits (Krea as ComfyUI's node; Nano Banana Pro ours).
+  CHECK(k.referencePixels({{"resolution", "1K"}}) == 1024LL * 1024 && k.referencePixels({{"resolution", "2K"}}) == 2048LL * 2048);
+  CHECK(n.referencePixels({{"resolution", "4K"}}) == 4096LL * 4096);
   std::printf("test_model_spec: %zu model(s) %s\n", cpo::allModels().size(), failures ? "FAILED" : "OK");
   return failures ? 1 : 0;
 }

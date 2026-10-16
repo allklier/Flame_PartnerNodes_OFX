@@ -1,5 +1,7 @@
-"""Result cache, writer side. Layout must match ofx/src/core/cache.h:
-  <root>/<k[0:2]>/<key>.img    b"CPOI" u32 version W H 1 3, then H*W*3 float16, rows top-down
+"""Result cache, writer side. Layout must match ofx/src/core/cache.h (decision 16):
+  <root>/<k[0:2]>/<key>.model.<ext>      the image exactly as the API returned it
+  <root>/<k[0:2]>/<key>.<variant>.img    b"CPOI" u32 version W H 1 3, then H*W*3 float16, rows
+                                         top-down; variant "display" or "source"
   <root>/pending/<key>         holds the pid of the job generating it
   <root>/jobs/<job id>.json    final job status, read by the plugin
 """
@@ -19,8 +21,32 @@ IN_MAGIC = b"CPOA"   # staged reference frame: float32 RGB
 OUT_MAGIC = b"CPOI"  # result: float16 RGB
 
 
-def result_path(root: str, key: str) -> str:
-    return os.path.join(root, key[:2], key + ".img")
+VARIANTS = ("display", "source")
+
+
+def result_path(root: str, key: str, variant: str) -> str:
+    return os.path.join(root, key[:2], f"{key}.{variant}.img")
+
+
+def model_ext(data: bytes) -> str:
+    if data.startswith(b"\x89PNG"):
+        return "png"
+    if data.startswith(b"\xff\xd8"):
+        return "jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return "bin"
+
+
+def write_model_image(root: str, key: str, data: bytes) -> str:
+    """The API's image, byte for byte (atomic)."""
+    path = os.path.join(root, key[:2], f"{key}.model.{model_ext(data)}")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return path
 
 
 def pending_path(root: str, key: str) -> str:
@@ -39,12 +65,14 @@ def read_staged(path: str) -> np.ndarray:
     return data.reshape(h, w, 3)
 
 
-def write_result(root: str, key: str, image: np.ndarray) -> str:
+def write_result(root: str, key: str, variant: str, image: np.ndarray) -> str:
     """Atomic: a temp file in the target folder, then rename over the final name."""
     h, w, c = image.shape
     if c != 3:
         raise ValueError(f"result must be RGB, got {c} channels")
-    path = result_path(root, key)
+    if variant not in VARIANTS:
+        raise ValueError(f"unknown variant {variant!r}")
+    path = result_path(root, key, variant)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.tmp{os.getpid()}"
     with open(tmp, "wb") as f:

@@ -59,10 +59,6 @@ class Krea3Test(unittest.TestCase):
         with self.assertRaises(ValueError):
             krea3.build_request(FakeRouter(), dict(PARAMS, prompt="  "), [], Log())
 
-    def test_reference_pixels(self):
-        self.assertEqual(krea3.reference_pixels({"resolution": "1K"}), 1024 * 1024)
-        self.assertEqual(krea3.reference_pixels({"resolution": "2K"}), 2048 * 2048)
-
     def test_result_images(self):
         class R:
             def download(self, url):

@@ -31,7 +31,7 @@ ModelSpec make() {
   s.label = "Krea 3";
   s.module = "krea3";
   s.version = "krea3-router-v1";
-  s.maxReferences = 1;  // the source's first frame (decision 3)
+  s.maxReferences = 5;  // Image 1..5 (decision 15); Krea accepts up to 8
   s.columns = {"Prompt", "Output"};
   auto add = [&](ModelParam p) { s.params.push_back(p); };
 
@@ -63,6 +63,10 @@ ModelSpec make() {
   add(precise);
 
   s.costHint = krea3Cost;
+  // As ComfyUI's Krea3ImageNode: references scaled to the output pixel budget (nodes_krea.py).
+  s.referencePixels = [](const ParamValues& v) -> long long {
+    return v.count("resolution") && v.at("resolution") == "1K" ? 1024LL * 1024 : 2048LL * 2048;
+  };
   return s;
 }
 

@@ -3,8 +3,9 @@
   <runtime python> -I -B job.py <manifest.json> [--no-ui]
   COMFY_API_KEY in the environment (never on argv or in a file; LTX decision 13).
 
-The plugin has staged the source's first frame (float32 RGB, worker/cpo/cache.py read_staged) in
-its staging folder (the manifest's folder) and computed the result's cache key. This process,
+The plugin has staged the first frame of each connected input (Image 1..n, float32 RGB,
+worker/cpo/cache.py read_staged) in its staging folder (the manifest's folder) and computed the
+result's cache key. This process,
 outside Flame:
   - shows a progress window with a Cancel button (cpo/oslayer.py; zenity on Linux),
   - converts the reference to display-referred sRGB (cpo/colour.py, OCIO) and to a PNG,
@@ -13,7 +14,8 @@ outside Flame:
     the source colour space, and writes it into the cache,
   - always cleans up its staged files and pending marker, records a final status, and drops a
     refresh marker for the Flame hook (decision 7).
-Manifest: job_id node_id model label input width height colour ocio_config params{} cache_root key
+Manifest: job_id node_id model label inputs[] width height colour ocio_config reference_pixels
+params{} cache_root key
 flame_pid title. Status file <cache_root>/jobs/<job_id>.json: running -> done | failed | cancelled.
 """
 
@@ -138,15 +140,18 @@ def generate(m: dict, api_key: str, stage: Stage, progress: Progress) -> str:
     conv = colour.Converter(m.get("colour", "Bypass"), m.get("ocio_config", ""))
     log.info(conv.describe())
     refs = []
-    if m.get("input"):
-        stage.set(0.05, "Preparing the reference frame")
-        frame = cache.read_staged(m["input"])
-        refs.append(imageio.to_png(conv.to_display(frame), model.reference_pixels(params)))
-        log.info(f"reference: {frame.shape[1]}x{frame.shape[0]} -> PNG {len(refs[0])} bytes")
+    for i, path in enumerate(m.get("inputs", [])):  # decision 15: Image 1..n in order
+        stage.set(0.05, f"Preparing Image {i + 1}")
+        frame = cache.read_staged(path)
+        limit = int(m.get("reference_pixels", 0))  # the plugin's ModelSpec (decision 17)
+        refs.append(imageio.to_png(conv.to_display(frame), limit))
+        scaled = limit and frame.shape[0] * frame.shape[1] > limit
+        log.info(f"Image {i + 1}: {frame.shape[1]}x{frame.shape[0]} -> PNG {len(refs[-1])} bytes"
+                 + (f" (scaled down to the model's {limit / 1e6:.1f} MP)" if scaled else ""))
     if progress.cancelled():
         raise Cancelled()
     router = Router(api_key, log)
-    stage.set(0.10, "Uploading the reference" if refs else "Preparing the request")
+    stage.set(0.10, f"Uploading {len(refs)} image(s)" if refs else "Preparing the request")
     body = model.build_request(router, params, refs, log)
     log.info(f"request {model.MODEL_ID}: {json.dumps(loggable(body))}")
     if progress.cancelled():
@@ -165,10 +170,15 @@ def generate(m: dict, api_key: str, stage: Stage, progress: Progress) -> str:
     stage.set(0.85, "Downloading the result")
     data = model.result_images(router, response)[0]
     stage.set(0.92, "Converting the result")
+    # Decision 16: keep the API's image as is, plus both variants the Output param chooses from
+    # without a new run: "display" (the model's pixels) and "source" (back to the Input Colour; the
+    # same pixels without inputs or with Bypass).
+    root, key = m["cache_root"], m["key"]
+    raw = cache.write_model_image(root, key, data)
     img = imageio.fill_crop(data, int(m["width"]), int(m["height"]))
-    out = conv.from_display(img)
-    path = cache.write_result(m["cache_root"], m["key"], out)
-    log.info(f"result: {len(data)} bytes -> {m['width']}x{m['height']} in {path}")
+    cache.write_result(root, key, "source", conv.from_display(img) if m.get("inputs") else img)
+    path = cache.write_result(root, key, "display", img)
+    log.info(f"result: {len(data)} bytes ({os.path.basename(raw)}) -> {m['width']}x{m['height']} display + source")
     return path
 
 
@@ -187,7 +197,7 @@ def main() -> int:
     cache.mark_pending(root, key, os.getpid())
     cache.write_status(root, job_id, "running", "")
     t0 = time.time()
-    log.info(f"start: {m.get('label')} ({m['model']}) {m['width']}x{m['height']} reference={'yes' if m.get('input') else 'no'} "
+    log.info(f"start: {m.get('label')} ({m['model']}) {m['width']}x{m['height']} inputs={len(m.get('inputs', []))} "
              f"colour={m.get('colour')} key={key} python={sys.executable} {sys.version.split()[0]} ui={ui} "
              f"api key {len(api_key)} characters")
 
@@ -216,7 +226,7 @@ def main() -> int:
         progress.close()
         cache.clear_pending(root, key)
         cache.write_status(root, job_id, state, message)
-        for p in [m.get("input"), manifest_path, pid_file]:
+        for p in [*m.get("inputs", []), manifest_path, pid_file]:
             try:
                 if p:
                     os.unlink(p)

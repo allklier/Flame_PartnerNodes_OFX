@@ -8,8 +8,11 @@ for image editing and text-to-image.
 > **Unofficial.** This is an independent project, not affiliated with or endorsed by Comfy
 > Organization, Inc., Krea or Autodesk. You need your own Comfy account and API key, and every
 > generation is billed to that account. See [Licensing and terms](#licensing-and-terms).
+>
+> **Provided as is.** These nodes are built on Comfy Router's API as it works today. If Comfy
+> changes that API or access to its endpoints, the nodes may stop working without warning.
 
-Status: early development (0.2). Linux (Rocky 9) only so far.
+Status: first release (0.1). Linux (Rocky 9, Flame 2027) and macOS (Apple Silicon).
 
 ## How it works
 
@@ -21,15 +24,25 @@ Status: early development (0.2). Linux (Rocky 9) only so far.
 - The request runs in the background with its own progress window and Cancel button; Flame stays
   responsive. When it finishes, the viewer refreshes and the result is cached on disk, so it
   survives reloading the Batch.
-- Colour: set **Input Colour** to your source's colour space. The frame goes to the model through
-  the ACES 2.0 SDR (Rec.709) view of Flame's colour config, and the result comes back through the
-  inverse. Results are limited to SDR range.
+- Inputs: **Image 1** to **Image 5**, connected in order from Image 1. The first frame of each is
+  sent; refer to them in the prompt as `@Image1`, `@Image2`, ... With nothing connected the node
+  generates from the prompt alone at 1920x1080. Inputs larger than the model takes are scaled down
+  before upload; Generate tells you first, so you can scale them yourself instead.
+- Colour: set **Input Colour** to your inputs' colour space. They go to the model through the
+  ACES 2.0 SDR (Rec.709) view of Flame's colour config. **Output** then chooses what you get:
+  **BT.1886 Display** (the model's image, tagged Rec.1886 so Flame converts it downstream),
+  **Source Colour Space** (converted back to the Input Colour, limited to SDR range) or **Bypass**
+  (the model's image untouched). Switching Output doesn't run the model again.
 
 ## Setup
 
-1. Install the bundle in `/usr/OFX/Plugins` and restart Flame. The node appears under
+1. Quit Flame, unpack the release for your platform and run `sudo ./install.sh` in its folder
+   (`sudo ./install.sh --uninstall` removes it). It installs the bundle in `/usr/OFX/Plugins`
+   (macOS: `/Library/OFX/Plugins`) and, unless LTX Alpha Gen's is already there, a small Flame
+   Python hook that refreshes the viewer when a result arrives. Start Flame: the nodes are under
    **Partner Models**.
-2. On the node's **Setup** tab, press **Install** once. It installs a small Python runtime
+2. On the node's **Setup** tab, press **Install** once (macOS needs the Command Line Tools:
+   `xcode-select --install`). It installs a small Python runtime
    (numpy, OpenColorIO, Pillow; about 250 MB, ~30 s) into the Runtime Folder.
 3. Create an API key at [platform.comfy.org](https://platform.comfy.org) (it starts with
    `comfyui-`), paste it into **API Key** on the Setup tab and press **Save Key**. The key is
@@ -49,7 +62,11 @@ Status: early development (0.2). Linux (Rocky 9) only so far.
   under their terms.
 - **Names.** Comfy, ComfyUI, Comfy Router, Krea and Flame are trademarks of their owners, named
   here only to say what the plugin works with.
-- **No guarantee.** Comfy can change or stop its API at any time, which may break the plugin.
+- **Provided as is, without warranty.** The nodes are built against the current Comfy Router API
+  and the model endpoints it offers. Comfy can change, restrict or discontinue that API, or access
+  to any endpoint or model, at any time; the nodes may then stop working without warning, and there
+  is no promise of a fix. (The MPL 2.0 disclaimer of warranty and limitation of liability, sections
+  6 and 7 of [LICENSE](LICENSE), apply.)
 - Generated images are AI-generated content; check the model provider's terms for any disclosure
   requirements.
 

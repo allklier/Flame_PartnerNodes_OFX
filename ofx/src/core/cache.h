@@ -1,7 +1,10 @@
-// Content-addressed result cache on disk (LTX decision 36). One generated image per key.
+// Content-addressed result cache on disk (LTX decision 36). One generation per key (decision 16).
 // Layout under the cache root (must match worker/cpo/cache.py):
-//   <root>/<k[0:2]>/<key>.img    "CPOI" header (FrameFileHeader, n=1, c=3), then h*w*3 fp16,
-//                                rows top-down, already in the source colour space and size
+//   <root>/<k[0:2]>/<key>.model.<png|jpg|webp|bin>  the image exactly as the API returned it
+//   <root>/<k[0:2]>/<key>.<variant>.img  "CPOI" header (FrameFileHeader, n=1, c=3), then h*w*3
+//                                fp16, rows top-down, at the output size; variant "display" (the
+//                                model's pixels, filled and cropped) or "source" (converted back
+//                                to the Input Colour). The Output param picks one, no new run.
 //   <root>/pending/<key>         exists while a job is generating that key; holds the job pid
 //   <root>/jobs/<job id>.json    final job status (done / failed / cancelled + message)
 #pragma once
@@ -39,12 +42,12 @@ std::string defaultCacheRoot();
 // Everything that changes the result besides the reference pixels.
 std::string resultKey(uint64_t sourceFrameHash, const std::string& paramSignature);
 
-std::string resultPath(const std::string& root, const std::string& key);
+std::string resultPath(const std::string& root, const std::string& key, const std::string& variant);
 std::string pendingPath(const std::string& root, const std::string& key);
 
-// Reads one result (w*h*3 halves, rows top-down) and refreshes its mtime for the LRU sweep.
-bool readResult(const std::string& root, const std::string& key, uint32_t w, uint32_t h,
-                std::vector<uint16_t>& out);
+// Reads one result variant (w*h*3 halves, rows top-down) and refreshes its mtime for the LRU sweep.
+bool readResult(const std::string& root, const std::string& key, const std::string& variant, uint32_t w,
+                uint32_t h, std::vector<uint16_t>& out);
 
 // True while a live job holds the key's pending marker.
 bool isPending(const std::string& root, const std::string& key);
@@ -55,6 +58,7 @@ bool isPending(const std::string& root, const std::string& key);
 void markPending(const std::string& root, const std::string& key, int pid);
 void clearPending(const std::string& root, const std::string& key);
 
+// Removes every file of the key (the model image and its variants); true if any was there.
 bool purgeKey(const std::string& root, const std::string& key);
 uint64_t cacheBytes(const std::string& root);
 uint64_t purgeAll(const std::string& root);  // returns bytes freed
@@ -63,7 +67,8 @@ struct SweepResult {
   size_t aged = 0, capped = 0, kept = 0;
   uint64_t bytesFreed = 0, bytesKept = 0;
 };
-// Deletes results unused for maxAgeDays, then least-recently-used until under capGB.
+// Deletes keys unused for maxAgeDays, then least-recently-used keys until under capGB. A key's files
+// (model image + variants) go together, by the newest of their mtimes.
 // Also clears pending markers of dead jobs.
 SweepResult sweepCache(const CacheSettings& s);
 

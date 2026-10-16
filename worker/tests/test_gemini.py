@@ -43,7 +43,6 @@ class GeminiTest(unittest.TestCase):
     def test_module(self):
         self.assertIs(load("nano_banana_pro"), nano_banana_pro)
         self.assertEqual(nano_banana_pro.MODEL_ID, "vertexai/gemini-3-pro-image")
-        self.assertEqual(nano_banana_pro.reference_pixels({"resolution": "4K"}), 4096 * 4096)
         with self.assertRaises(ValueError):
             load("gemini")  # a family helper, not a model
 

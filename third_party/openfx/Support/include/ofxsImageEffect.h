@@ -1158,6 +1158,12 @@ namespace OFX {
     */
     virtual bool getTimeDomain(OfxRangeD &range);
 
+    /** @brief [Partner Models patch, see VENDORED.txt] OFX 1.5 kOfxImageEffectActionGetOutputColourspace
+        (ofxColour.h). preferred = the host's kOfxImageClipPropPreferredColourspaces (may be empty).
+        Return true and set colourspace (a colourspace name or "OfxColourspace_<clip>") to answer;
+        false = not trapped, the host uses the first input clip's colourspace. */
+    virtual bool getOutputColourspace(const std::vector<std::string> &preferred, std::string &colourspace);
+
 #ifdef OFX_SUPPORTS_OPENGLRENDER
     /** @brief OpenGL context attached */
     virtual void contextAttached(void);

@@ -5,6 +5,8 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include <fcntl.h>
+
 #include <cstdio>
 #include <fstream>
 
@@ -29,6 +31,8 @@ std::string gb(double bytes) {
 }  // namespace
 
 std::string stagingDir() { return "/dev/shm"; }
+
+int reserveFile(int fd, long long total) { return ::posix_fallocate(fd, 0, off_t(total)); }
 
 std::string processName(unsigned pid) {
   std::ifstream comm("/proc/" + std::to_string(pid) + "/comm");

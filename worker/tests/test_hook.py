@@ -112,3 +112,40 @@ class RefreshTargetTest(unittest.TestCase):
             job.signal_refresh(d, "j1", "n1", "done")
             with open(os.path.join(d, "j1.json")) as f:
                 self.assertEqual(json.load(f)["node_id"], "n1")
+
+
+class EditTextTest(unittest.TestCase):
+    """Decision 13: oslayer.edit_text with a stand-in zenity on PATH (Linux path)."""
+
+    def run_editor(self, script: str):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+        from cpo import oslayer
+
+        with tempfile.TemporaryDirectory() as d:
+            fake = os.path.join(d, "zenity")
+            with open(fake, "w") as f:
+                f.write("#!/bin/sh\n" + script)
+            os.chmod(fake, 0o755)
+            path = os.path.join(d, "prompt.txt")
+            with open(path, "w") as f:
+                f.write("old prompt")
+            with mock.patch.object(sys, "platform", "linux"), mock.patch.dict(os.environ, {"PATH": d}):
+                code = oslayer.edit_text(path, "Krea 3 - Prompt")
+            with open(path) as f:
+                return code, f.read()
+
+    def test_ok_writes_the_text(self):
+        # zenity prints the edited text on OK; GTK warnings on stderr must not reach the prompt.
+        code, text = self.run_editor('echo "Gtk-WARNING noise" >&2\nprintf "new prompt\\nline 2\\n"\nexit 0\n')
+        self.assertEqual((code, text), (0, "new prompt\nline 2"))
+
+    def test_cancel_keeps_the_file(self):
+        self.assertEqual(self.run_editor("exit 1\n"), (1, "old prompt"))
+
+    def test_no_zenity(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+        from cpo import oslayer
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.dict(os.environ, {"PATH": d}):
+            self.assertEqual(oslayer.edit_text(os.path.join(d, "x"), "t"), 2)

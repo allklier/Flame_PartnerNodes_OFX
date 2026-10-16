@@ -20,8 +20,8 @@ static int failures = 0;
   } while (0)
 
 static void writeResult(const std::string& root, const std::string& key, uint32_t w, uint32_t h,
-                        const char* magic, uint32_t channels) {
-  const std::string path = cpo::resultPath(root, key);
+                        const char* magic, uint32_t channels, const char* variant = "display") {
+  const std::string path = cpo::resultPath(root, key, variant);
   mkdir(path.substr(0, path.rfind('/')).c_str(), 0755);
   FILE* f = std::fopen(path.c_str(), "wb");
   cpo::FrameFileHeader hdr{};
@@ -48,18 +48,27 @@ int main() {
   CHECK(k1 == cpo::resultKey(42, "v1|model=a|prompt=x"));
   CHECK(k1 != cpo::resultKey(43, "v1|model=a|prompt=x"));
   CHECK(k1 != cpo::resultKey(42, "v1|model=a|prompt=y"));
-  CHECK(cpo::resultPath(root, k1) == root + "/" + k1.substr(0, 2) + "/" + k1 + ".img");
+  CHECK(cpo::resultPath(root, k1, "display") == root + "/" + k1.substr(0, 2) + "/" + k1 + ".display.img");
 
   std::vector<uint16_t> out;
-  CHECK(!cpo::readResult(root, k1, 4, 3, out));  // missing
+  CHECK(!cpo::readResult(root, k1, "display", 4, 3, out));  // missing
   writeResult(root, k1, 4, 3, "CPOI", 3);
-  CHECK(cpo::readResult(root, k1, 4, 3, out));
+  CHECK(cpo::readResult(root, k1, "display", 4, 3, out));
   CHECK(out.size() == 36 && out[0] == 0x3c00 && out[35] == 0x3c00);
-  CHECK(!cpo::readResult(root, k1, 5, 3, out));  // wrong size
+  CHECK(!cpo::readResult(root, k1, "source", 4, 3, out));  // that variant isn't there
+  CHECK(!cpo::readResult(root, k1, "display", 5, 3, out));  // wrong size
   const std::string k2 = cpo::resultKey(1, "x");
   writeResult(root, k2, 4, 3, "CPOA", 3);          // wrong magic
-  CHECK(!cpo::readResult(root, k2, 4, 3, out));
+  CHECK(!cpo::readResult(root, k2, "display", 4, 3, out));
   CHECK(cpo::cacheBytes(root) == 2 * (24 + 36 * 2));
+  // Decision 16: a key's model image and variants count, purge and sweep together.
+  writeResult(root, k1, 4, 3, "CPOI", 3, "source");
+  {
+    FILE* f = std::fopen((root + "/" + k1.substr(0, 2) + "/" + k1 + ".model.png").c_str(), "wb");
+    std::fputs("PNGDATA", f);  // 7 bytes
+    std::fclose(f);
+  }
+  CHECK(cpo::cacheBytes(root) == 3 * (24 + 36 * 2) + 7);
 
   // Pending markers follow the owner's pid.
   CHECK(!cpo::isPending(root, k1));
@@ -76,10 +85,17 @@ int main() {
   s.maxAgeDays = 30;
   s.capGB = 20.0;
   const cpo::SweepResult sw = cpo::sweepCache(s);
-  CHECK(sw.kept == 2 && sw.aged == 0 && sw.capped == 0);
+  CHECK(sw.kept == 2 && sw.aged == 0 && sw.capped == 0);  // keys, not files
   CHECK(access(cpo::pendingPath(root, k2).c_str(), F_OK) != 0);  // dead job's marker swept
+  s.capGB = 1e-9;  // over the cap: whole keys go, never one variant of a key
+  const cpo::SweepResult capped = cpo::sweepCache(s);
+  CHECK(capped.capped == 2 && cpo::cacheBytes(root) == 0);
+  writeResult(root, k1, 4, 3, "CPOI", 3);
+  writeResult(root, k1, 4, 3, "CPOI", 3, "source");
   CHECK(cpo::purgeKey(root, k1));
   CHECK(!cpo::purgeKey(root, k1));
+  CHECK(cpo::cacheBytes(root) == 0);
+  writeResult(root, k2, 4, 3, "CPOI", 3);
   CHECK(cpo::purgeAll(root) == 24 + 36 * 2);
   CHECK(cpo::cacheBytes(root) == 0);
 
