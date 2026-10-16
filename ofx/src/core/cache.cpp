@@ -1,0 +1,229 @@
+#include "cache.h"
+
+#include <dirent.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <fstream>
+
+#include "platform.h"
+
+namespace cpo {
+
+namespace {
+
+std::vector<std::string> listDir(const std::string& dir) {
+  std::vector<std::string> out;
+  if (DIR* d = opendir(dir.c_str())) {
+    while (dirent* e = readdir(d)) {
+      if (e->d_name[0] != '.') out.emplace_back(e->d_name);
+    }
+    closedir(d);
+  }
+  return out;
+}
+
+bool endsWith(const std::string& s, const std::string& suffix) {
+  return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+int readPid(const std::string& path) {
+  std::ifstream in(path);
+  int pid = 0;
+  in >> pid;
+  return pid;
+}
+
+constexpr const char* kExt = ".img";
+
+}  // namespace
+
+bool pidAlive(int pid) { return pid > 0 && (kill(pid, 0) == 0 || errno == EPERM); }
+
+std::string defaultCacheRoot() {
+  const char* home = std::getenv("HOME");
+  return std::string(home ? home : "/tmp") + "/.cache/partner-models-ofx/results";
+}
+
+CacheSettings cacheSettings(const UserConfig& cfg) {
+  CacheSettings s;
+  s.root = cfg.count("cache_dir") && !cfg.at("cache_dir").empty() ? cfg.at("cache_dir") : defaultCacheRoot();
+  if (cfg.count("cache_max_days")) s.maxAgeDays = std::atoi(cfg.at("cache_max_days").c_str());
+  if (cfg.count("cache_cap_gb")) s.capGB = std::atof(cfg.at("cache_cap_gb").c_str());
+  return s;
+}
+
+std::string resultKey(uint64_t sourceFrameHash, const std::string& paramSignature) {
+  uint64_t h = 1469598103934665603ULL;
+  for (int i = 0; i < 8; ++i) h = (h ^ ((sourceFrameHash >> (8 * i)) & 0xff)) * 1099511628211ULL;
+  for (unsigned char c : paramSignature) h = (h ^ c) * 1099511628211ULL;
+  char buf[17];
+  std::snprintf(buf, sizeof buf, "%016llx", static_cast<unsigned long long>(h));
+  return buf;
+}
+
+std::string resultPath(const std::string& root, const std::string& key) {
+  return root + "/" + key.substr(0, 2) + "/" + key + kExt;
+}
+
+std::string pendingPath(const std::string& root, const std::string& key) {
+  return root + "/pending/" + key;
+}
+
+bool readResult(const std::string& root, const std::string& key, uint32_t w, uint32_t h,
+                std::vector<uint16_t>& out) {
+  const std::string path = resultPath(root, key);
+  const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  FrameFileHeader hdr{};
+  const size_t n = size_t(w) * h * 3;
+  bool ok = pread(fd, &hdr, sizeof hdr, 0) == ssize_t(sizeof hdr) &&
+            std::memcmp(hdr.magic, "CPOI", 4) == 0 && hdr.version == kFileVersion && hdr.width == w &&
+            hdr.height == h && hdr.frames == 1 && hdr.channels == 3;
+  if (ok) {
+    out.resize(n);
+    ok = pread(fd, out.data(), n * 2, sizeof hdr) == ssize_t(n * 2);
+  }
+  close(fd);
+  if (ok) utimensat(AT_FDCWD, path.c_str(), nullptr, 0);  // mark as recently used
+  return ok;
+}
+
+bool isPending(const std::string& root, const std::string& key) {
+  const std::string p = pendingPath(root, key);
+  if (access(p.c_str(), F_OK) != 0) return false;
+  return pidAlive(readPid(p));
+}
+
+void markPending(const std::string& root, const std::string& key, int pid) {
+  mkdir(root.c_str(), 0755);
+  mkdir((root + "/pending").c_str(), 0755);
+  const std::string text = std::to_string(pid);
+  const int fd = open(pendingPath(root, key).c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) return;
+  (void)!write(fd, text.data(), text.size());
+  close(fd);
+}
+
+void clearPending(const std::string& root, const std::string& key) { unlink(pendingPath(root, key).c_str()); }
+
+bool purgeKey(const std::string& root, const std::string& key) {
+  return unlink(resultPath(root, key).c_str()) == 0;
+}
+
+uint64_t cacheBytes(const std::string& root) {
+  uint64_t total = 0;
+  for (const auto& sub : listDir(root)) {
+    if (sub.size() != 2) continue;
+    for (const auto& f : listDir(root + "/" + sub)) {
+      struct stat st {};
+      if (endsWith(f, kExt) && stat((root + "/" + sub + "/" + f).c_str(), &st) == 0)
+        total += uint64_t(st.st_size);
+    }
+  }
+  return total;
+}
+
+uint64_t purgeAll(const std::string& root) {
+  uint64_t freed = 0;
+  for (const auto& sub : listDir(root)) {
+    if (sub.size() != 2) continue;
+    for (const auto& f : listDir(root + "/" + sub)) {
+      const std::string p = root + "/" + sub + "/" + f;
+      struct stat st {};
+      if (endsWith(f, kExt) && stat(p.c_str(), &st) == 0 && unlink(p.c_str()) == 0)
+        freed += uint64_t(st.st_size);
+    }
+  }
+  return freed;
+}
+
+SweepResult sweepCache(const CacheSettings& s) {
+  SweepResult r;
+  struct Entry {
+    std::string path;
+    time_t mtime;
+    uint64_t size;
+  };
+  std::vector<Entry> entries;
+  const time_t now = time(nullptr);
+  const time_t maxAge = time_t(s.maxAgeDays) * 86400;
+  for (const auto& sub : listDir(s.root)) {
+    if (sub.size() != 2) continue;
+    for (const auto& f : listDir(s.root + "/" + sub)) {
+      if (!endsWith(f, kExt)) continue;
+      const std::string p = s.root + "/" + sub + "/" + f;
+      struct stat st {};
+      if (stat(p.c_str(), &st) != 0) continue;
+      if (s.maxAgeDays > 0 && now - st.st_mtime > maxAge) {
+        if (unlink(p.c_str()) == 0) {
+          ++r.aged;
+          r.bytesFreed += uint64_t(st.st_size);
+        }
+        continue;
+      }
+      entries.push_back({p, st.st_mtime, uint64_t(st.st_size)});
+    }
+  }
+  uint64_t total = 0;
+  for (const auto& e : entries) total += e.size;
+  const uint64_t cap = uint64_t(s.capGB * 1024.0 * 1024.0 * 1024.0);
+  if (s.capGB > 0 && total > cap) {
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry& a, const Entry& b) { return a.mtime < b.mtime; });  // oldest first
+    for (const auto& e : entries) {
+      if (total <= cap) break;
+      if (unlink(e.path.c_str()) == 0) {
+        total -= e.size;
+        ++r.capped;
+        r.bytesFreed += e.size;
+      }
+    }
+  }
+  r.bytesKept = total;
+  r.kept = entries.size() - r.capped;
+  for (const auto& f : listDir(s.root + "/pending")) {  // markers of jobs that no longer run
+    const std::string p = s.root + "/pending/" + f;
+    if (!pidAlive(readPid(p))) unlink(p.c_str());
+  }
+  return r;
+}
+
+size_t sweepStaleStaging() {
+  // cpo_job_<id>[_in.bin|.json|.pid]: handed to a job (<id> has no '_' or '.');
+  // cpo_job_<id>.pid names the job's pid. Same rules as LTX's sweep.
+  size_t removed = 0;
+  const std::string dir = stagingDir();
+  const auto files = listDir(dir);
+  const time_t now = time(nullptr);
+  const std::string prefix = "cpo_job_";
+  auto jobBase = [&](const std::string& f) { return f.substr(0, f.find_first_of("_.", prefix.size())); };
+  std::vector<std::string> deadJobs, liveJobs;
+  for (const auto& f : files)
+    if (f.rfind(prefix, 0) == 0 && endsWith(f, ".pid"))
+      (pidAlive(readPid(dir + "/" + f)) ? liveJobs : deadJobs).push_back(jobBase(f));
+  auto contains = [](const std::vector<std::string>& v, const std::string& s) {
+    return std::find(v.begin(), v.end(), s) != v.end();
+  };
+  for (const auto& f : files) {
+    if (f.rfind(prefix, 0) != 0) continue;
+    const std::string p = dir + "/" + f;
+    const std::string base = jobBase(f);
+    struct stat st {};
+    const bool young = stat(p.c_str(), &st) == 0 && now - st.st_mtime < 600;
+    // No pid file yet: a job being launched (young) or one that never started (old).
+    const bool stale = contains(deadJobs, base) || (!contains(liveJobs, base) && !young);
+    if (stale && unlink(p.c_str()) == 0) ++removed;
+  }
+  return removed;
+}
+
+}  // namespace cpo
